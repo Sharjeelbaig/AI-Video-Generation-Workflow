@@ -28,6 +28,7 @@ DEFAULTS = {
     "crf": "20",
     "audio-bitrate": "96k",
     "codec": "libx264",
+    "seperate-text-by-seperatorline": "yes",
     "limit": None,
 }
 
@@ -48,11 +49,20 @@ NAMED_COLORS = {
 }
 
 
-ARABIC_RUN_RE = re.compile(r"[\u0600-\u06FF\u0750-\u077F\u08A0-\u08FF\uFB50-\uFDFF\uFE70-\uFEFF]+")
+ARABIC_CHAR_RE = re.compile(r"[\u0600-\u06FF\u0750-\u077F\u08A0-\u08FF\uFB50-\uFDFF\uFE70-\uFEFF]")
+RTL_EMBED = "\u202B"
+POP_DIRECTIONAL = "\u202C"
+
+
+OPTION_ALIASES = {
+    "separate-text-by-separatorline": "seperate-text-by-seperatorline",
+    "separate-text-by-separator-line": "seperate-text-by-seperatorline",
+    "seperate-text-by-separatorline": "seperate-text-by-seperatorline",
+}
 
 
 USAGE = """Usage:
-  python generate-video font-color=white background=black words-per-scene=10
+  python generate-video.py font-color=white background=black words-per-scene=10
 
 Optional key=value arguments:
   script=script.txt
@@ -71,6 +81,7 @@ Optional key=value arguments:
   crf=20
   audio-bitrate=96k
   codec=libx264
+  seperate-text-by-seperatorline=yes
   limit=25
 """
 
@@ -90,7 +101,7 @@ def parse_args(argv: list[str]) -> dict[str, str | None]:
         if "=" not in arg:
             fail(f"Arguments must use key=value format. Invalid argument: {arg}")
         key, value = arg.split("=", 1)
-        key = key.strip().lower()
+        key = OPTION_ALIASES.get(key.strip().lower(), key.strip().lower())
         if key not in DEFAULTS:
             fail(f"Unknown option: {key}")
         options[key] = value.strip()
@@ -119,6 +130,18 @@ def parse_non_negative_int(name: str, value: str | None) -> int:
     if parsed < 0:
         fail(f"{name} must be 0 or greater")
     return parsed
+
+
+def parse_bool(name: str, value: str | None) -> bool:
+    if value is None or value == "":
+        return False
+
+    normalized = value.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    fail(f"{name} must be yes/no, true/false, on/off, or 1/0")
 
 
 def natural_sort_key(path: Path) -> list[object]:
@@ -166,6 +189,85 @@ def split_scene_text(text: str, words_per_scene: int) -> list[str]:
         " ".join(words[index : index + words_per_scene])
         for index in range(0, len(words), words_per_scene)
     ]
+
+
+def build_segment_bound_scenes(
+    segments: list[str],
+    wav_files: list[Path],
+    words_per_scene: int,
+) -> tuple[list[tuple[str, float, float]], float]:
+    scenes: list[tuple[str, float, float]] = []
+    current_time = 0.0
+
+    for text, wav_path in zip(segments, wav_files, strict=True):
+        duration = get_wav_duration(wav_path)
+        chunks = split_scene_text(text, words_per_scene)
+        chunk_duration = duration / len(chunks)
+
+        for chunk in chunks:
+            start = current_time
+            end = current_time + chunk_duration
+            scenes.append((chunk, start, end))
+            current_time = end
+
+    return scenes, current_time
+
+
+def build_word_bound_scenes(
+    segments: list[str],
+    wav_files: list[Path],
+    words_per_scene: int,
+) -> tuple[list[tuple[str, float, float]], float]:
+    timed_words: list[tuple[str, float]] = []
+    leading_gap = 0.0
+
+    for text, wav_path in zip(segments, wav_files, strict=True):
+        duration = get_wav_duration(wav_path)
+        words = text.split()
+        if not words:
+            if timed_words:
+                last_word, last_duration = timed_words[-1]
+                timed_words[-1] = (last_word, last_duration + duration)
+            else:
+                leading_gap += duration
+            continue
+
+        word_duration = duration / len(words)
+        timed_words.extend((word, word_duration) for word in words)
+
+    total_duration = leading_gap + sum(duration for _, duration in timed_words)
+    if not timed_words:
+        return [("", 0.0, total_duration)], total_duration
+
+    scenes: list[tuple[str, float, float]] = []
+    current_time = leading_gap
+    scene_words: list[str] = []
+    scene_duration = 0.0
+
+    for word, duration in timed_words:
+        scene_words.append(word)
+        scene_duration += duration
+        if words_per_scene > 0 and len(scene_words) < words_per_scene:
+            continue
+
+        start = current_time
+        end = current_time + scene_duration
+        scenes.append((" ".join(scene_words), start, end))
+        current_time = end
+        scene_words = []
+        scene_duration = 0.0
+
+    if scene_words or not scenes:
+        start = current_time
+        end = current_time + scene_duration
+        scenes.append((" ".join(scene_words), start, end))
+        current_time = end
+
+    if scenes and current_time < total_duration:
+        text, start, _ = scenes[-1]
+        scenes[-1] = (text, start, total_duration)
+
+    return scenes, total_duration
 
 
 def get_wav_duration(path: Path) -> float:
@@ -254,25 +356,64 @@ def escape_ass_text(text: str) -> str:
     )
 
 
+def is_arabic_char(char: str) -> bool:
+    return bool(ARABIC_CHAR_RE.fullmatch(char))
+
+
+def is_arabic_joiner(char: str) -> bool:
+    return char.isspace() or char in ".,;:!?()[]{}<>-_/\\'\"،؛؟"
+
+
+def consume_arabic_span(text: str, start_index: int) -> int:
+    index = start_index
+    last_arabic_end = start_index
+
+    while index < len(text):
+        while index < len(text) and is_arabic_char(text[index]):
+            index += 1
+            last_arabic_end = index
+
+        joiner_start = index
+        while index < len(text) and is_arabic_joiner(text[index]):
+            index += 1
+
+        if index > joiner_start and index < len(text) and is_arabic_char(text[index]):
+            continue
+
+        return last_arabic_end
+
+    return last_arabic_end
+
+
 def format_ass_text(text: str, default_font: str, arabic_font: str | None) -> str:
     if not arabic_font or arabic_font == default_font:
         return escape_ass_text(text)
 
     parts: list[str] = []
-    last_index = 0
+    index = 0
+    plain_start = 0
 
-    for match in ARABIC_RUN_RE.finditer(text):
-        if match.start() > last_index:
-            parts.append(escape_ass_text(text[last_index : match.start()]))
+    while index < len(text):
+        if not is_arabic_char(text[index]):
+            index += 1
+            continue
+
+        span_end = consume_arabic_span(text, index)
+        if index > plain_start:
+            parts.append(escape_ass_text(text[plain_start:index]))
+
+        arabic_span = RTL_EMBED + text[index:span_end] + POP_DIRECTIONAL
         parts.append(
             r"{\fn" + arabic_font + "}"
-            + escape_ass_text(match.group(0))
+            + escape_ass_text(arabic_span)
             + r"{\fn" + default_font + "}"
         )
-        last_index = match.end()
 
-    if last_index < len(text):
-        parts.append(escape_ass_text(text[last_index:]))
+        index = span_end
+        plain_start = span_end
+
+    if plain_start < len(text):
+        parts.append(escape_ass_text(text[plain_start:]))
 
     return "".join(parts) if parts else escape_ass_text(text)
 
@@ -281,6 +422,7 @@ def build_subtitle_content(
     segments: list[str],
     wav_files: list[Path],
     words_per_scene: int,
+    seperate_text_by_seperatorline: bool,
     width: int,
     height: int,
     font: str,
@@ -314,22 +456,18 @@ def build_subtitle_content(
         "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text",
     ]
 
-    current_time = 0.0
-    for text, wav_path in zip(segments, wav_files, strict=True):
-        duration = get_wav_duration(wav_path)
-        chunks = split_scene_text(text, words_per_scene)
-        chunk_duration = duration / len(chunks)
+    if seperate_text_by_seperatorline:
+        scenes, total_duration = build_segment_bound_scenes(segments, wav_files, words_per_scene)
+    else:
+        scenes, total_duration = build_word_bound_scenes(segments, wav_files, words_per_scene)
 
-        for chunk in chunks:
-            start = current_time
-            end = current_time + chunk_duration
-            escaped_text = format_ass_text(chunk, default_font=font, arabic_font=arabic_font)
-            lines.append(
-                f"Dialogue: 0,{ass_timestamp(start)},{ass_timestamp(end)},Default,,0,0,0,,{escaped_text}"
-            )
-            current_time = end
+    for text, start, end in scenes:
+        escaped_text = format_ass_text(text, default_font=font, arabic_font=arabic_font)
+        lines.append(
+            f"Dialogue: 0,{ass_timestamp(start)},{ass_timestamp(end)},Default,,0,0,0,,{escaped_text}"
+        )
 
-    return "\n".join(lines) + "\n", current_time
+    return "\n".join(lines) + "\n", total_duration
 
 
 def build_ffconcat_content(wav_files: list[Path]) -> str:
@@ -418,6 +556,10 @@ def main() -> None:
     height = parse_positive_int("height", options["height"])
     fps = parse_positive_int("fps", options["fps"])
     words_per_scene = parse_non_negative_int("words-per-scene", options["words-per-scene"])
+    seperate_text_by_seperatorline = parse_bool(
+        "seperate-text-by-seperatorline",
+        options["seperate-text-by-seperatorline"],
+    )
     limit = parse_limit(options["limit"])
 
     font_size_value = options["font-size"]
@@ -444,6 +586,7 @@ def main() -> None:
         segments=segments,
         wav_files=wav_files,
         words_per_scene=words_per_scene,
+        seperate_text_by_seperatorline=seperate_text_by_seperatorline,
         width=width,
         height=height,
         font=font,
