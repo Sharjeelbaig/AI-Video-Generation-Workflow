@@ -74,6 +74,7 @@ STYLE_SUBHEADING = "subheading"
 MARKUP_TAG_RE = re.compile(r"<\s*/?\s*(heading|subheading)\s*>", re.IGNORECASE)
 HEADING_TAG_RE = re.compile(r"<\s*/?\s*heading\s*>", re.IGNORECASE)
 SUBHEADING_TAG_RE = re.compile(r"<\s*/?\s*subheading\s*>", re.IGNORECASE)
+WAV_INDEX_RE = re.compile(r"_(\d+)_\d+\.wav$", re.IGNORECASE)
 
 
 @dataclass(frozen=True)
@@ -216,19 +217,90 @@ def parse_script_segment(value: str) -> ScriptSegment:
     return ScriptSegment(text=cleaned_text, style=style)
 
 
-def load_script_segments(script_path: Path, expected_count: int) -> list[ScriptSegment]:
+def load_script_segments(script_path: Path) -> tuple[list[ScriptSegment], list[ScriptSegment], list[int]]:
     raw_segments = [parse_script_segment(piece) for piece in script_path.read_text(encoding="utf-8").split("---")]
+    non_empty_segments: list[ScriptSegment] = []
+    non_empty_raw_indices: list[int] = []
+    for index, segment in enumerate(raw_segments):
+        if not segment.text:
+            continue
+        non_empty_segments.append(segment)
+        non_empty_raw_indices.append(index)
+    return raw_segments, non_empty_segments, non_empty_raw_indices
+
+
+def extract_wav_index(path: Path) -> int | None:
+    match = WAV_INDEX_RE.search(path.name)
+    if match is None:
+        return None
+    return int(match.group(1))
+
+
+def preview_segment_text(text: str, limit: int = 60) -> str:
+    if len(text) <= limit:
+        return text
+    return text[: limit - 3].rstrip() + "..."
+
+
+def format_segment_refs(indices: list[int], segments: list[ScriptSegment], limit: int = 3) -> str:
+    refs: list[str] = []
+    for index in indices[:limit]:
+        preview = preview_segment_text(segments[index].text or "<empty>")
+        refs.append(f"{index} ({preview!r})")
+    if len(indices) > limit:
+        refs.append(f"+{len(indices) - limit} more")
+    return ", ".join(refs)
+
+
+def build_segment_count_error(
+    raw_segments: list[ScriptSegment],
+    non_empty_segments: list[ScriptSegment],
+    wav_files: list[Path],
+) -> str:
+    message = (
+        f"Script segment count ({len(raw_segments)} raw / {len(non_empty_segments)} non-empty) "
+        f"does not match WAV file count ({len(wav_files)})"
+    )
+
+    wav_indices = [extract_wav_index(path) for path in wav_files]
+    if any(index is None for index in wav_indices):
+        return message
+
+    indexed_wav_files = [index for index in wav_indices if index is not None]
+    missing_indices = sorted(set(range(len(raw_segments))) - set(indexed_wav_files))
+    extra_indices = sorted(set(indexed_wav_files) - set(range(len(raw_segments))))
+    details: list[str] = []
+    if missing_indices:
+        details.append(f"missing audio indices: {format_segment_refs(missing_indices, raw_segments)}")
+    if extra_indices:
+        details.append(f"unexpected audio indices: {', '.join(str(index) for index in extra_indices[:5])}")
+    if not details:
+        return message
+    return f"{message}; {'; '.join(details)}"
+
+
+def resolve_script_segments(
+    raw_segments: list[ScriptSegment],
+    non_empty_segments: list[ScriptSegment],
+    non_empty_raw_indices: list[int],
+    wav_files: list[Path],
+) -> list[ScriptSegment]:
+    expected_count = len(wav_files)
+    wav_indices = [extract_wav_index(path) for path in wav_files]
+
+    if all(index is not None for index in wav_indices):
+        indexed_wav_files = [index for index in wav_indices if index is not None]
+        if indexed_wav_files == list(range(expected_count)) and len(raw_segments) >= expected_count:
+            return raw_segments[:expected_count]
+        if indexed_wav_files == non_empty_raw_indices[:expected_count] and len(non_empty_segments) >= expected_count:
+            return non_empty_segments[:expected_count]
+
     if len(raw_segments) == expected_count:
         return raw_segments
-
-    non_empty_segments = [piece for piece in raw_segments if piece.text]
     if len(non_empty_segments) == expected_count:
         return non_empty_segments
 
-    fail(
-        f"Script segment count ({len(raw_segments)} raw / {len(non_empty_segments)} non-empty) "
-        f"does not match WAV file count ({expected_count})"
-    )
+    fail(build_segment_count_error(raw_segments, non_empty_segments, wav_files))
 
 
 def split_scene_text(text: str, words_per_scene: int) -> list[str]:
@@ -717,9 +789,8 @@ def main() -> None:
     if limit is not None:
         wav_files = wav_files[:limit]
 
-    segments = load_script_segments(script_path, len(find_wav_files(audio_dir)))
-    if limit is not None:
-        segments = segments[:limit]
+    raw_segments, non_empty_segments, non_empty_raw_indices = load_script_segments(script_path)
+    segments = resolve_script_segments(raw_segments, non_empty_segments, non_empty_raw_indices, wav_files)
 
     subtitle_content, total_duration = build_subtitle_content(
         segments=segments,
