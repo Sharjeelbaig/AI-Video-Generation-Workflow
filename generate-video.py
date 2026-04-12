@@ -8,6 +8,7 @@ import subprocess
 import sys
 import tempfile
 import wave
+from dataclasses import dataclass
 from pathlib import Path
 
 
@@ -17,8 +18,12 @@ DEFAULTS = {
     "output": "output.mp4",
     "font": "Helvetica",
     "arabic-font": "Geeza Pro",
+    "heading-font": None,
+    "subheading-font": None,
     "font-size": None,
     "font-color": "white",
+    "heading-font-color": "yellow",
+    "subheading-font-color": "yellow",
     "background": "black",
     "words-per-scene": "10",
     "width": "1920",
@@ -58,7 +63,43 @@ OPTION_ALIASES = {
     "separate-text-by-separatorline": "seperate-text-by-seperatorline",
     "separate-text-by-separator-line": "seperate-text-by-seperatorline",
     "seperate-text-by-separatorline": "seperate-text-by-seperatorline",
+    "heading-color": "heading-font-color",
+    "subheading-color": "subheading-font-color",
 }
+
+
+STYLE_NORMAL = "normal"
+STYLE_HEADING = "heading"
+STYLE_SUBHEADING = "subheading"
+MARKUP_TAG_RE = re.compile(r"<\s*/?\s*(heading|subheading)\s*>", re.IGNORECASE)
+HEADING_TAG_RE = re.compile(r"<\s*/?\s*heading\s*>", re.IGNORECASE)
+SUBHEADING_TAG_RE = re.compile(r"<\s*/?\s*subheading\s*>", re.IGNORECASE)
+
+
+@dataclass(frozen=True)
+class ScriptSegment:
+    text: str
+    style: str = STYLE_NORMAL
+
+
+@dataclass(frozen=True)
+class StyledRun:
+    text: str
+    style: str
+
+
+@dataclass(frozen=True)
+class SceneChunk:
+    runs: list[StyledRun]
+    start: float
+    end: float
+
+
+@dataclass(frozen=True)
+class TextStyle:
+    font: str
+    font_size: int
+    color: str
 
 
 USAGE = """Usage:
@@ -70,8 +111,12 @@ Optional key=value arguments:
   output=output.mp4
   font=Helvetica
   arabic-font=Geeza Pro
+  heading-font=Helvetica
+  subheading-font=Helvetica
   font-size=72
   font-color=white
+  heading-font-color=yellow
+  subheading-font-color=yellow
   background=black
   words-per-scene=10
   width=1920
@@ -160,12 +205,23 @@ def normalize_text(value: str) -> str:
     return " ".join(value.split())
 
 
-def load_script_segments(script_path: Path, expected_count: int) -> list[str]:
-    raw_segments = [normalize_text(piece) for piece in script_path.read_text(encoding="utf-8").split("---")]
+def parse_script_segment(value: str) -> ScriptSegment:
+    style = STYLE_NORMAL
+    if HEADING_TAG_RE.search(value):
+        style = STYLE_HEADING
+    elif SUBHEADING_TAG_RE.search(value):
+        style = STYLE_SUBHEADING
+
+    cleaned_text = normalize_text(MARKUP_TAG_RE.sub(" ", value))
+    return ScriptSegment(text=cleaned_text, style=style)
+
+
+def load_script_segments(script_path: Path, expected_count: int) -> list[ScriptSegment]:
+    raw_segments = [parse_script_segment(piece) for piece in script_path.read_text(encoding="utf-8").split("---")]
     if len(raw_segments) == expected_count:
         return raw_segments
 
-    non_empty_segments = [piece for piece in raw_segments if piece]
+    non_empty_segments = [piece for piece in raw_segments if piece.text]
     if len(non_empty_segments) == expected_count:
         return non_empty_segments
 
@@ -192,67 +248,87 @@ def split_scene_text(text: str, words_per_scene: int) -> list[str]:
 
 
 def build_segment_bound_scenes(
-    segments: list[str],
+    segments: list[ScriptSegment],
     wav_files: list[Path],
     words_per_scene: int,
-) -> tuple[list[tuple[str, float, float]], float]:
-    scenes: list[tuple[str, float, float]] = []
+) -> tuple[list[SceneChunk], float]:
+    scenes: list[SceneChunk] = []
     current_time = 0.0
 
-    for text, wav_path in zip(segments, wav_files, strict=True):
+    for segment, wav_path in zip(segments, wav_files, strict=True):
         duration = get_wav_duration(wav_path)
-        chunks = split_scene_text(text, words_per_scene)
+        chunks = split_scene_text(segment.text, words_per_scene)
         chunk_duration = duration / len(chunks)
 
         for chunk in chunks:
             start = current_time
             end = current_time + chunk_duration
-            scenes.append((chunk, start, end))
+            scenes.append(SceneChunk(runs=[StyledRun(chunk, segment.style)], start=start, end=end))
             current_time = end
 
     return scenes, current_time
 
 
+def build_scene_runs(words: list[tuple[str, str]]) -> list[StyledRun]:
+    if not words:
+        return [StyledRun("", STYLE_NORMAL)]
+
+    runs: list[StyledRun] = []
+    current_style = words[0][1]
+    current_words: list[str] = []
+
+    for word, style in words:
+        if style != current_style and current_words:
+            runs.append(StyledRun(" ".join(current_words), current_style))
+            current_words = []
+            current_style = style
+        current_words.append(word)
+
+    if current_words:
+        runs.append(StyledRun(" ".join(current_words), current_style))
+    return runs
+
+
 def build_word_bound_scenes(
-    segments: list[str],
+    segments: list[ScriptSegment],
     wav_files: list[Path],
     words_per_scene: int,
-) -> tuple[list[tuple[str, float, float]], float]:
-    timed_words: list[tuple[str, float]] = []
+) -> tuple[list[SceneChunk], float]:
+    timed_words: list[tuple[str, str, float]] = []
     leading_gap = 0.0
 
-    for text, wav_path in zip(segments, wav_files, strict=True):
+    for segment, wav_path in zip(segments, wav_files, strict=True):
         duration = get_wav_duration(wav_path)
-        words = text.split()
+        words = segment.text.split()
         if not words:
             if timed_words:
-                last_word, last_duration = timed_words[-1]
-                timed_words[-1] = (last_word, last_duration + duration)
+                last_word, last_style, last_duration = timed_words[-1]
+                timed_words[-1] = (last_word, last_style, last_duration + duration)
             else:
                 leading_gap += duration
             continue
 
         word_duration = duration / len(words)
-        timed_words.extend((word, word_duration) for word in words)
+        timed_words.extend((word, segment.style, word_duration) for word in words)
 
-    total_duration = leading_gap + sum(duration for _, duration in timed_words)
+    total_duration = leading_gap + sum(duration for _, _, duration in timed_words)
     if not timed_words:
-        return [("", 0.0, total_duration)], total_duration
+        return [SceneChunk(runs=[StyledRun("", STYLE_NORMAL)], start=0.0, end=total_duration)], total_duration
 
-    scenes: list[tuple[str, float, float]] = []
+    scenes: list[SceneChunk] = []
     current_time = leading_gap
-    scene_words: list[str] = []
+    scene_words: list[tuple[str, str]] = []
     scene_duration = 0.0
 
-    for word, duration in timed_words:
-        scene_words.append(word)
+    for word, style, duration in timed_words:
+        scene_words.append((word, style))
         scene_duration += duration
         if words_per_scene > 0 and len(scene_words) < words_per_scene:
             continue
 
         start = current_time
         end = current_time + scene_duration
-        scenes.append((" ".join(scene_words), start, end))
+        scenes.append(SceneChunk(runs=build_scene_runs(scene_words), start=start, end=end))
         current_time = end
         scene_words = []
         scene_duration = 0.0
@@ -260,12 +336,12 @@ def build_word_bound_scenes(
     if scene_words or not scenes:
         start = current_time
         end = current_time + scene_duration
-        scenes.append((" ".join(scene_words), start, end))
+        scenes.append(SceneChunk(runs=build_scene_runs(scene_words), start=start, end=end))
         current_time = end
 
     if scenes and current_time < total_duration:
-        text, start, _ = scenes[-1]
-        scenes[-1] = (text, start, total_duration)
+        last_scene = scenes[-1]
+        scenes[-1] = SceneChunk(runs=last_scene.runs, start=last_scene.start, end=total_duration)
 
     return scenes, total_duration
 
@@ -418,8 +494,46 @@ def format_ass_text(text: str, default_font: str, arabic_font: str | None) -> st
     return "".join(parts) if parts else escape_ass_text(text)
 
 
+def resolve_text_style(
+    style: str,
+    normal_style: TextStyle,
+    heading_style: TextStyle,
+    subheading_style: TextStyle,
+) -> TextStyle:
+    if style == STYLE_HEADING:
+        return heading_style
+    if style == STYLE_SUBHEADING:
+        return subheading_style
+    return normal_style
+
+
+def format_styled_run(text: str, style: TextStyle, arabic_font: str | None) -> str:
+    if not text:
+        return ""
+
+    formatted_text = format_ass_text(text, default_font=style.font, arabic_font=arabic_font)
+    return (
+        r"{\fn" + style.font + r"\fs" + str(style.font_size) + r"\1c" + style.color + r"&}"
+        + formatted_text
+    )
+
+
+def format_scene_text(
+    runs: list[StyledRun],
+    normal_style: TextStyle,
+    heading_style: TextStyle,
+    subheading_style: TextStyle,
+    arabic_font: str | None,
+) -> str:
+    parts: list[str] = []
+    for run in runs:
+        run_style = resolve_text_style(run.style, normal_style, heading_style, subheading_style)
+        parts.append(format_styled_run(run.text, run_style, arabic_font))
+    return "".join(parts)
+
+
 def build_subtitle_content(
-    segments: list[str],
+    segments: list[ScriptSegment],
     wav_files: list[Path],
     words_per_scene: int,
     seperate_text_by_seperatorline: bool,
@@ -427,12 +541,27 @@ def build_subtitle_content(
     height: int,
     font: str,
     arabic_font: str | None,
+    heading_font: str,
+    subheading_font: str,
     font_size: int,
     font_color: str,
+    heading_font_color: str,
+    subheading_font_color: str,
 ) -> tuple[str, float]:
     primary_color = to_ass_color(font_color)
     outline_color = to_ass_color("black")
     margin_v = max(40, height // 12)
+    normal_style = TextStyle(font=font, font_size=font_size, color=primary_color)
+    subheading_style = TextStyle(
+        font=subheading_font,
+        font_size=font_size,
+        color=to_ass_color(subheading_font_color),
+    )
+    heading_style = TextStyle(
+        font=heading_font,
+        font_size=subheading_style.font_size * 2,
+        color=to_ass_color(heading_font_color),
+    )
 
     lines = [
         "[Script Info]",
@@ -461,10 +590,16 @@ def build_subtitle_content(
     else:
         scenes, total_duration = build_word_bound_scenes(segments, wav_files, words_per_scene)
 
-    for text, start, end in scenes:
-        escaped_text = format_ass_text(text, default_font=font, arabic_font=arabic_font)
+    for scene in scenes:
+        escaped_text = format_scene_text(
+            scene.runs,
+            normal_style=normal_style,
+            heading_style=heading_style,
+            subheading_style=subheading_style,
+            arabic_font=arabic_font,
+        )
         lines.append(
-            f"Dialogue: 0,{ass_timestamp(start)},{ass_timestamp(end)},Default,,0,0,0,,{escaped_text}"
+            f"Dialogue: 0,{ass_timestamp(scene.start)},{ass_timestamp(scene.end)},Default,,0,0,0,,{escaped_text}"
         )
 
     return "\n".join(lines) + "\n", total_duration
@@ -545,7 +680,11 @@ def main() -> None:
     output_file = Path(options["output"] or DEFAULTS["output"])
     font = options["font"] or DEFAULTS["font"]
     arabic_font = options["arabic-font"] or DEFAULTS["arabic-font"]
+    heading_font = options["heading-font"] or font
+    subheading_font = options["subheading-font"] or font
     font_color = options["font-color"] or DEFAULTS["font-color"]
+    heading_font_color = options["heading-font-color"] or DEFAULTS["heading-font-color"]
+    subheading_font_color = options["subheading-font-color"] or DEFAULTS["subheading-font-color"]
     background = options["background"] or DEFAULTS["background"]
     codec = options["codec"] or DEFAULTS["codec"]
     preset = options["preset"] or DEFAULTS["preset"]
@@ -591,8 +730,12 @@ def main() -> None:
         height=height,
         font=font,
         arabic_font=arabic_font,
+        heading_font=heading_font,
+        subheading_font=subheading_font,
         font_size=font_size,
         font_color=font_color,
+        heading_font_color=heading_font_color,
+        subheading_font_color=subheading_font_color,
     )
     concat_content = build_ffconcat_content(wav_files)
 

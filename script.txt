@@ -1,16 +1,20 @@
-Location and Nature of Arab Tribes.
+<Heading>Location and Nature of Arab Tribes.<Heading>
 ---
 Beyond a shadow of doubt,
 ---
-the biography of Prophet مُحَمَّد Peace and blessings be upon him manifestedly represents an exhaustive embodiment of the sublime Divine Message that he communicated in order to deliver the human race from the swamp of darkness and polytheism to the paradise of light and monotheism. An image,
+the biography of Prophet مُحَمَّد Peace and blessings be upon him manifestedly represents an exhaustive embodiment of the sublime Divine Message
 ---
-authentic as well as comprehensive,
+that he communicated in order to deliver the human race from the swamp of darkness and polytheism
 ---
-of this Message is therefore only attainable through careful study and profound analysis of both backgrounds and issues of such a biography. In view of this,
+to the paradise of light and monotheism. An image, authentic as well as comprehensive, of this Message is therefore only attainable through careful study
+---
+and profound analysis of both backgrounds and issues of such a biography. 
+---
+In view of this,
 ---
 a whole chapter is here introduced about the nature and development of Arab tribes prior to Islam as well as the circumstantial environment that enwrapped the Prophet's mission.
 ---
-LOCATION OF THE ARABS:
+<SubHeading>LOCATION OF THE ARABS:</SubHeading>
 ---
 Linguistically,
 ---
@@ -50,13 +54,13 @@ culture,
 ---
 religion and art.
 ---
-ARAB TRIBES:
+<SubHeading>ARAB TRIBES:</SubHeading>
 ---
 Arab kinfolks have been divided according to lineage into three groups: 
 ---
-Perishing Arabs, The ancient Arabs
+Perishing Arabs,
 ---
-of whose history little is known,
+The ancient Arabs of whose history little is known,
 ---
 and of whom were عَاد,
 ---
@@ -70,13 +74,17 @@ and of whom were عَاد,
 ---
 and others.
 ---
-Pure Arabs, Who originated from the progeny of يَعْرُب بْن يَشْجُب بْن قَحْطَان. They were also called قَحْطَانِيُّون. Arabized Arabs: Who originated from the progeny of إِسْمَاعِيل. They were also called عَدْنَانِيُّون.
+Pure Arabs,
+---
+Who originated from the progeny of يَعْرُب بْن يَشْجُب بْن قَحْطَان. They were also called قَحْطَانِيُّون. 
+---
+Arabized Arabs: Who originated from the progeny of إِسْمَاعِيل. They were also called عَدْنَانِيُّون.
 ---
 The pure Arabs - the people of قَحْطَان - originally lived in يَمَن and comprised many tribes,
 ---
-two of which were very famous: 1. حِمْيَر: The most famous of whose septs were زَيْد الجُمْهُور,
+two of which were very famous:  حِمْيَر: The most famous of whose septs were زَيْد الجُمْهُور,
 ---
-قُضَاعَة and سَكَاسِك. 2. كَهْلَان: The most famous of whose septs were هَمْدَان,
+قُضَاعَة and سَكَاسِك.  كَهْلَان: The most famous of whose septs were هَمْدَان,
 ---
 أَنْمَار,
 ---
@@ -104,13 +112,11 @@ the competition between كَهْلَان and حِمْيَر led to the evacuatio
 ---
 THE EMIGRATING SEPTS OF كَهْلَان CAN BE INTO FOUR GROUPS:
 ---
-1. أَزْد: Who,
----
-under the leadership of عِمْرَان بْن عَمْرُو مُزَيْقِيَاء,
+ أَزْد: Who, under the leadership of عِمْرَان بْن عَمْرُو مُزَيْقِيَاء,
 ---
 wandered in يَمَن,
 ---
-sent pioneers and finally headed northwards. Details of their emigration can be summed up as follows: 2. ثَعْلَبَة بْن عَمْرُو left his tribe أَزْد for حِجَاز and dwelt between ثَعْلَبِيَّة and ذِي قَار. When he gained strength,
+sent pioneers and finally headed northwards. Details of their emigration can be summed up as follows:  ثَعْلَبَة بْن عَمْرُو left his tribe أَزْد for حِجَاز and dwelt between ثَعْلَبِيَّة and ذِي قَار. When he gained strength,
 ---
 he headed for مَدِينَة where he stayed. Of his seed are أَوْس and خَزْرَج,
 ---
@@ -138,11 +144,11 @@ in حِجَاز,
 ---
 where they stopped on their way to شَام.
 ---
-2. لَخْم and جُذَام: Of whom was نَصْر بْن رَبِيعَة,
+ لَخْم and جُذَام: Of whom was نَصْر بْن رَبِيعَة,
 ---
 father of مَنَاذِرَة,
 ---
-Kings of حِيرَة. 3. بَنُو طَيِّئ: Who also emigrated northwards to settle by the so-called أَجَا and سَلْمَى Mountains which were consequently named as طَيِّئ Mountains. 4. كِنْدَة: Who dwelt in بَحْرَيْن but were expelled to حَضْرَمَوْت and نَجْد where they instituted a powerful government but not for long,
+Kings of حِيرَة.  بَنُو طَيِّئ: Who also emigrated northwards to settle by the so-called أَجَا and سَلْمَى Mountains which were consequently named as طَيِّئ Mountains.  كِنْدَة: Who dwelt in بَحْرَيْن but were expelled to حَضْرَمَوْت and نَجْد where they instituted a powerful government but not for long,
 ---
 for the whole tribe soon faded away.
 ---
