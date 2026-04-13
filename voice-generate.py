@@ -1,6 +1,7 @@
 from pathlib import Path
 import os
 import re
+from typing import Any
 
 from mlx_audio.tts.generate import generate_audio
 from mlx_audio.tts.utils import load
@@ -15,6 +16,7 @@ REF_TEXT = (
     "longest of nights."
 )
 TAG_RE = re.compile(r"<[^>]*>")
+IMAGE_BLOCK_TAG_RE = re.compile(r"<\s*image\s*>.*?<\s*/\s*image\s*>", re.IGNORECASE | re.DOTALL)
 ARABIC_CHAR_RE = re.compile(r"[\u0600-\u06FF\u0750-\u077F\u08A0-\u08FF\uFB50-\uFDFF\uFE70-\uFEFF]")
 LATIN_CHAR_RE = re.compile(r"[A-Za-z]")
 OUTPUT_DIR = Path("output")
@@ -22,7 +24,8 @@ SCRIPT_PATH = Path("script.txt")
 
 
 def clean_tts_text(value: str) -> str:
-    return " ".join(TAG_RE.sub(" ", value).split())
+    without_image_prompts = IMAGE_BLOCK_TAG_RE.sub(" ", value)
+    return " ".join(TAG_RE.sub(" ", without_image_prompts).split())
 
 
 def preview_text(value: str, limit: int = 80) -> str:
@@ -42,7 +45,7 @@ def lang_codes_for_text(text: str) -> list[str]:
     return list(dict.fromkeys(codes))
 
 
-def generate_segment_audio(model: object, text: str, index: int) -> None:
+def generate_segment_audio(model: Any, text: str, index: int) -> None:
     for existing_file in segment_output_files(index):
         existing_file.unlink()
 
