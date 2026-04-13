@@ -8,6 +8,7 @@ import subprocess
 import sys
 import tempfile
 import wave
+import zlib
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -514,17 +515,6 @@ def to_ass_color(value: str, alpha: str = "00") -> str:
     return f"&H{alpha}{blue}{green}{red}"
 
 
-def normalize_ffmpeg_color(value: str) -> str:
-    normalized = value.strip().lower()
-    if normalized in NAMED_COLORS:
-        return normalized
-    if normalized.startswith("#"):
-        normalized = normalized[1:]
-    if re.fullmatch(r"[0-9a-fA-F]{6}", normalized):
-        return f"0x{normalized.upper()}"
-    return value
-
-
 def ass_timestamp(seconds: float) -> str:
     rounded = max(0, int(round(seconds * 100)))
     hours, remainder = divmod(rounded, 360000)
@@ -733,6 +723,79 @@ def build_ffconcat_content(wav_files: list[Path]) -> str:
     return "\n".join(lines) + "\n"
 
 
+def parse_color_rgb(value: str) -> tuple[int, int, int]:
+    rgb = parse_color_hex(value)
+    return (
+        int(rgb[0:2], 16),
+        int(rgb[2:4], 16),
+        int(rgb[4:6], 16),
+    )
+
+
+def write_png_chunk(chunk_type: bytes, data: bytes) -> bytes:
+    payload = chunk_type + data
+    return (
+        len(data).to_bytes(4, "big")
+        + payload
+        + zlib.crc32(payload).to_bytes(4, "big")
+    )
+
+
+def write_solid_png_image(path: Path, color: tuple[int, int, int]) -> None:
+    png_signature = b"\x89PNG\r\n\x1a\n"
+    ihdr = (
+        (1).to_bytes(4, "big")
+        + (1).to_bytes(4, "big")
+        + b"\x08"  # bit depth
+        + b"\x02"  # color type: truecolor RGB
+        + b"\x00"  # compression
+        + b"\x00"  # filter
+        + b"\x00"  # interlace
+    )
+    pixel_data = b"\x00" + bytes(color)  # filter byte + RGB pixel
+    idat = zlib.compress(pixel_data)
+    png_bytes = (
+        png_signature
+        + write_png_chunk(b"IHDR", ihdr)
+        + write_png_chunk(b"IDAT", idat)
+        + write_png_chunk(b"IEND", b"")
+    )
+    path.write_bytes(png_bytes)
+
+
+def build_background_ffconcat_content(
+    scenes: list[SceneChunk],
+    scene_backgrounds: list[Path | None],
+    fallback_image: Path,
+) -> str:
+    fallback_path = fallback_image.resolve()
+    timeline: list[tuple[Path, float]] = []
+
+    for scene, image_path in zip(scenes, scene_backgrounds, strict=True):
+        duration = max(0.0, scene.end - scene.start)
+        if duration <= 0:
+            continue
+
+        resolved_image = image_path.resolve() if image_path is not None else fallback_path
+        if timeline and timeline[-1][0] == resolved_image:
+            previous_image, previous_duration = timeline[-1]
+            timeline[-1] = (previous_image, previous_duration + duration)
+        else:
+            timeline.append((resolved_image, duration))
+
+    if not timeline:
+        timeline.append((fallback_path, 0.1))
+
+    lines = ["ffconcat version 1.0"]
+    for image_path, duration in timeline:
+        lines.append(f"file {shlex.quote(str(image_path))}")
+        lines.append(f"duration {duration:.6f}")
+
+    # Repeat the final file so ffmpeg honors the last duration entry.
+    lines.append(f"file {shlex.quote(str(timeline[-1][0]))}")
+    return "\n".join(lines) + "\n"
+
+
 def escape_subtitles_filter_path(path: Path) -> str:
     return path.as_posix().replace("\\", r"\\").replace(":", r"\:").replace("'", r"\'")
 
@@ -820,30 +883,17 @@ def resolve_scene_backgrounds(
 
 def run_ffmpeg(
     concat_file: Path,
+    background_concat_file: Path,
     subtitle_file: Path,
-    scenes: list[SceneChunk],
-    scene_backgrounds: list[Path | None],
     output_file: Path,
-    background: str,
     width: int,
     height: int,
     fps: int,
-    total_duration: float,
     codec: str,
     preset: str,
     crf: str,
     audio_bitrate: str,
 ) -> None:
-    color_value = normalize_ffmpeg_color(background)
-    color_input = f"color=c={color_value}:s={width}x{height}:r={fps}:d={total_duration:.6f}"
-
-    image_input_indexes: dict[Path, int] = {}
-    for image_path in scene_backgrounds:
-        if image_path is None:
-            continue
-        if image_path not in image_input_indexes:
-            image_input_indexes[image_path] = 2 + len(image_input_indexes)
-
     command = [
         "ffmpeg",
         "-y",
@@ -854,75 +904,25 @@ def run_ffmpeg(
         "-i",
         str(concat_file),
         "-f",
-        "lavfi",
+        "concat",
+        "-safe",
+        "0",
         "-i",
-        color_input,
+        str(background_concat_file),
     ]
-
-    for image_path in image_input_indexes:
-        command.extend([
-            "-loop",
-            "1",
-            "-i",
-            str(image_path),
-        ])
 
     filter_parts = [
-        f"[1:v]format=yuv420p,setsar=1[base]",
+        f"[1:v]"
+        f"fps={fps},"
+        f"scale={width}:{height}:force_original_aspect_ratio=increase,"
+        f"crop={width}:{height},"
+        f"setsar=1,"
+        f"format=yuv420p"
+        f"[base]",
     ]
 
-    for image_path, input_index in image_input_indexes.items():
-        filter_parts.append(
-            f"[{input_index}:v]"
-            f"scale={width}:{height}:force_original_aspect_ratio=increase,"
-            f"crop={width}:{height},setsar=1"
-            f"[img{input_index}]"
-        )
-
-    overlay_intervals_by_image: dict[Path, list[tuple[float, float]]] = {
-        image_path: []
-        for image_path in image_input_indexes
-    }
-    for scene, image_path in zip(scenes, scene_backgrounds, strict=True):
-        if image_path is None:
-            continue
-        overlay_intervals_by_image[image_path].append((scene.start, scene.end))
-
-    current_label = "base"
-    overlay_step = 0
-    for image_path, input_index in image_input_indexes.items():
-        intervals = overlay_intervals_by_image.get(image_path, [])
-        if not intervals:
-            continue
-
-        # Merge touching intervals to keep filter expressions compact.
-        merged_intervals: list[tuple[float, float]] = []
-        for start, end in intervals:
-            if not merged_intervals:
-                merged_intervals.append((start, end))
-                continue
-
-            previous_start, previous_end = merged_intervals[-1]
-            if start <= previous_end + 1e-6:
-                merged_intervals[-1] = (previous_start, max(previous_end, end))
-            else:
-                merged_intervals.append((start, end))
-
-        enable_expr = "+".join(
-            f"between(t,{start:.6f},{end:.6f})"
-            for start, end in merged_intervals
-        )
-        output_label = f"v{overlay_step}"
-        filter_parts.append(
-            f"[{current_label}][img{input_index}]"
-            f"overlay=0:0:enable='{enable_expr}'"
-            f"[{output_label}]"
-        )
-        current_label = output_label
-        overlay_step += 1
-
     subtitle_path = escape_subtitles_filter_path(subtitle_file)
-    filter_parts.append(f"[{current_label}]subtitles='{subtitle_path}'[vout]")
+    filter_parts.append(f"[base]subtitles='{subtitle_path}'[vout]")
 
     command.extend([
         "-filter_complex",
@@ -1010,7 +1010,7 @@ def main() -> None:
         wav_files,
     )
 
-    subtitle_content, total_duration, scenes = build_subtitle_content(
+    subtitle_content, _, scenes = build_subtitle_content(
         segments=segments,
         wav_files=wav_files,
         segment_raw_indices=segment_raw_indices,
@@ -1047,22 +1047,30 @@ def main() -> None:
     with tempfile.TemporaryDirectory(prefix="generate_video_") as temp_dir:
         temp_path = Path(temp_dir)
         concat_file = temp_path / "audio.ffconcat"
+        background_file = temp_path / "background.png"
+        background_concat_file = temp_path / "backgrounds.ffconcat"
         subtitle_file = temp_path / "subtitles.ass"
         concat_file.write_text(concat_content, encoding="utf-8")
+        write_solid_png_image(background_file, parse_color_rgb(background))
+        background_concat_file.write_text(
+            build_background_ffconcat_content(
+                scenes=scenes,
+                scene_backgrounds=scene_backgrounds,
+                fallback_image=background_file,
+            ),
+            encoding="utf-8",
+        )
         subtitle_file.write_text(subtitle_content, encoding="utf-8")
 
         try:
             run_ffmpeg(
                 concat_file=concat_file,
+                background_concat_file=background_concat_file,
                 subtitle_file=subtitle_file,
-                scenes=scenes,
-                scene_backgrounds=scene_backgrounds,
                 output_file=output_file,
-                background=background,
                 width=width,
                 height=height,
                 fps=fps,
-                total_duration=total_duration,
                 codec=codec,
                 preset=preset,
                 crf=crf,
