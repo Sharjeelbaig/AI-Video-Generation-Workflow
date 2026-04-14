@@ -27,7 +27,9 @@ DEFAULTS = {
     "heading-font-color": "yellow",
     "subheading-font-color": "yellow",
     "background": "black",
-    "words-per-scene": "10",
+    "words-per-scene": None,
+    "fade-transition": "no",
+    "fade-duration": "0.5",
     "width": "1920",
     "height": "1080",
     "fps": "30",
@@ -68,6 +70,14 @@ OPTION_ALIASES = {
     "heading-color": "heading-font-color",
     "subheading-color": "subheading-font-color",
     "image-dir": "images-dir",
+    "word-per-scene": "words-per-scene",
+    "fade": "fade-transition",
+}
+
+
+BOOLEAN_OPTIONS = {
+    "seperate-text-by-seperatorline",
+    "fade-transition",
 }
 
 
@@ -111,8 +121,15 @@ class TextStyle:
     color: str
 
 
+@dataclass(frozen=True)
+class BackgroundClip:
+    path: Path
+    duration: float
+
+
 USAGE = """Usage:
-  python generate-video.py font-color=white background=black words-per-scene=10
+  python generate-video.py font-color=white background=black
+  python generate-video.py --fade-transition fade-duration=0.5
 
 Optional key=value arguments:
   script=script.txt
@@ -128,7 +145,9 @@ Optional key=value arguments:
   heading-font-color=yellow
   subheading-font-color=yellow
   background=black
-  words-per-scene=10
+  words-per-scene=20
+  fade-transition=no
+  fade-duration=0.5
   width=1920
   height=1080
   fps=30
@@ -146,20 +165,50 @@ def fail(message: str) -> None:
     sys.exit(1)
 
 
+def normalize_option_key(raw_key: str) -> str:
+    stripped_key = raw_key.strip().lower()
+    if stripped_key.startswith("--"):
+        stripped_key = stripped_key[2:]
+    return OPTION_ALIASES.get(stripped_key, stripped_key)
+
+
 def parse_args(argv: list[str]) -> dict[str, str | None]:
     if any(arg in {"-h", "--help", "help"} for arg in argv):
         print(USAGE)
         sys.exit(0)
 
     options: dict[str, str | None] = dict(DEFAULTS)
-    for arg in argv:
-        if "=" not in arg:
-            fail(f"Arguments must use key=value format. Invalid argument: {arg}")
-        key, value = arg.split("=", 1)
-        key = OPTION_ALIASES.get(key.strip().lower(), key.strip().lower())
+    index = 0
+    while index < len(argv):
+        arg = argv[index]
+
+        if arg.startswith("--no-"):
+            key = normalize_option_key(arg[5:])
+            if key not in BOOLEAN_OPTIONS:
+                fail(f"Unknown boolean option: {arg}")
+            options[key] = "no"
+            index += 1
+            continue
+
+        if "=" in arg:
+            key, value = arg.split("=", 1)
+            key = normalize_option_key(key)
+        elif arg.startswith("--"):
+            key = normalize_option_key(arg)
+            if key in BOOLEAN_OPTIONS:
+                value = "yes"
+            else:
+                if index + 1 >= len(argv):
+                    fail(f"Missing value for option: {arg}")
+                value = argv[index + 1]
+                index += 1
+        else:
+            fail(f"Arguments must use key=value format or --option style. Invalid argument: {arg}")
+
         if key not in DEFAULTS:
             fail(f"Unknown option: {key}")
         options[key] = value.strip()
+        index += 1
     return options
 
 
@@ -182,6 +231,18 @@ def parse_non_negative_int(name: str, value: str | None) -> int:
         parsed = int(value)
     except ValueError as exc:
         raise SystemExit(f"Error: {name} must be an integer, got {value!r}") from exc
+    if parsed < 0:
+        fail(f"{name} must be 0 or greater")
+    return parsed
+
+
+def parse_non_negative_float(name: str, value: str | None) -> float:
+    if value is None or value == "":
+        return 0.0
+    try:
+        parsed = float(value)
+    except ValueError as exc:
+        raise SystemExit(f"Error: {name} must be a number, got {value!r}") from exc
     if parsed < 0:
         fail(f"{name} must be 0 or greater")
     return parsed
@@ -741,18 +802,22 @@ def write_png_chunk(chunk_type: bytes, data: bytes) -> bytes:
     )
 
 
-def write_solid_png_image(path: Path, color: tuple[int, int, int]) -> None:
+def write_solid_png_image(path: Path, color: tuple[int, int, int], width: int, height: int) -> None:
+    if width <= 0 or height <= 0:
+        fail("Fallback background dimensions must be greater than 0")
+
     png_signature = b"\x89PNG\r\n\x1a\n"
     ihdr = (
-        (1).to_bytes(4, "big")
-        + (1).to_bytes(4, "big")
+        width.to_bytes(4, "big")
+        + height.to_bytes(4, "big")
         + b"\x08"  # bit depth
         + b"\x02"  # color type: truecolor RGB
         + b"\x00"  # compression
         + b"\x00"  # filter
         + b"\x00"  # interlace
     )
-    pixel_data = b"\x00" + bytes(color)  # filter byte + RGB pixel
+    row = b"\x00" + (bytes(color) * width)
+    pixel_data = row * height
     idat = zlib.compress(pixel_data)
     png_bytes = (
         png_signature
@@ -763,13 +828,62 @@ def write_solid_png_image(path: Path, color: tuple[int, int, int]) -> None:
     path.write_bytes(png_bytes)
 
 
-def build_background_ffconcat_content(
+def get_image_dimensions(path: Path) -> tuple[int, int]:
+    try:
+        result = subprocess.run(
+            [
+                "ffprobe",
+                "-v",
+                "error",
+                "-select_streams",
+                "v:0",
+                "-show_entries",
+                "stream=width,height",
+                "-of",
+                "csv=p=0:s=x",
+                str(path),
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except FileNotFoundError as exc:
+        raise SystemExit("Error: ffprobe is required but was not found in PATH") from exc
+    except subprocess.CalledProcessError as exc:
+        raise SystemExit(f"Error: Unable to inspect image size for {path}") from exc
+
+    output = result.stdout.strip()
+    try:
+        raw_width, raw_height = output.split("x", 1)
+        width = int(raw_width)
+        height = int(raw_height)
+    except ValueError as exc:
+        raise SystemExit(f"Error: Unable to parse image dimensions for {path}: {output!r}") from exc
+
+    if width <= 0 or height <= 0:
+        raise SystemExit(f"Error: Invalid image dimensions for {path}: {width}x{height}")
+    return width, height
+
+
+def resolve_fallback_background_dimensions(
+    scene_backgrounds: list[Path | None],
+    width: int,
+    height: int,
+) -> tuple[int, int]:
+    for image_path in scene_backgrounds:
+        if image_path is None:
+            continue
+        return get_image_dimensions(image_path)
+    return width, height
+
+
+def build_background_timeline(
     scenes: list[SceneChunk],
     scene_backgrounds: list[Path | None],
     fallback_image: Path,
-) -> str:
+) -> list[BackgroundClip]:
     fallback_path = fallback_image.resolve()
-    timeline: list[tuple[Path, float]] = []
+    timeline: list[BackgroundClip] = []
 
     for scene, image_path in zip(scenes, scene_backgrounds, strict=True):
         duration = max(0.0, scene.end - scene.start)
@@ -777,22 +891,29 @@ def build_background_ffconcat_content(
             continue
 
         resolved_image = image_path.resolve() if image_path is not None else fallback_path
-        if timeline and timeline[-1][0] == resolved_image:
-            previous_image, previous_duration = timeline[-1]
-            timeline[-1] = (previous_image, previous_duration + duration)
+        if timeline and timeline[-1].path == resolved_image:
+            previous_clip = timeline[-1]
+            timeline[-1] = BackgroundClip(path=previous_clip.path, duration=previous_clip.duration + duration)
         else:
-            timeline.append((resolved_image, duration))
+            timeline.append(BackgroundClip(path=resolved_image, duration=duration))
 
     if not timeline:
-        timeline.append((fallback_path, 0.1))
+        timeline.append(BackgroundClip(path=fallback_path, duration=0.1))
+
+    return timeline
+
+
+def build_background_ffconcat_content(timeline: list[BackgroundClip]) -> str:
+    if not timeline:
+        fail("Background timeline must contain at least one clip")
 
     lines = ["ffconcat version 1.0"]
-    for image_path, duration in timeline:
-        lines.append(f"file {shlex.quote(str(image_path))}")
-        lines.append(f"duration {duration:.6f}")
+    for clip in timeline:
+        lines.append(f"file {shlex.quote(str(clip.path))}")
+        lines.append(f"duration {clip.duration:.6f}")
 
     # Repeat the final file so ffmpeg honors the last duration entry.
-    lines.append(f"file {shlex.quote(str(timeline[-1][0]))}")
+    lines.append(f"file {shlex.quote(str(timeline[-1].path))}")
     return "\n".join(lines) + "\n"
 
 
@@ -881,8 +1002,43 @@ def resolve_scene_backgrounds(
     return scene_backgrounds
 
 
+def build_background_filter(
+    input_label: str,
+    output_label: str,
+    width: int,
+    height: int,
+    fps: int,
+    duration: float | None = None,
+) -> str:
+    filter_parts = [
+        f"{input_label}"
+        f"fps={fps},"
+        f"scale={width}:{height}:force_original_aspect_ratio=increase,"
+        f"crop={width}:{height},"
+        f"setsar=1,"
+        f"format=yuv420p"
+    ]
+    if duration is not None:
+        filter_parts.append(f",trim=duration={duration:.6f}")
+    filter_parts.append(f",setpts=PTS-STARTPTS{output_label}")
+    return "".join(filter_parts)
+
+
+def resolve_transition_durations(
+    timeline: list[BackgroundClip],
+    fade_duration: float,
+) -> list[float]:
+    if len(timeline) < 2 or fade_duration <= 0:
+        return []
+
+    transition_durations = [fade_duration for _ in range(len(timeline) - 1)]
+    transition_durations[-1] = min(transition_durations[-1], timeline[-1].duration)
+    return transition_durations
+
+
 def run_ffmpeg(
     concat_file: Path,
+    background_timeline: list[BackgroundClip],
     background_concat_file: Path,
     subtitle_file: Path,
     output_file: Path,
@@ -893,6 +1049,8 @@ def run_ffmpeg(
     preset: str,
     crf: str,
     audio_bitrate: str,
+    fade_transition: bool,
+    fade_duration: float,
 ) -> None:
     command = [
         "ffmpeg",
@@ -903,23 +1061,64 @@ def run_ffmpeg(
         "0",
         "-i",
         str(concat_file),
-        "-f",
-        "concat",
-        "-safe",
-        "0",
-        "-i",
-        str(background_concat_file),
     ]
 
-    filter_parts = [
-        f"[1:v]"
-        f"fps={fps},"
-        f"scale={width}:{height}:force_original_aspect_ratio=increase,"
-        f"crop={width}:{height},"
-        f"setsar=1,"
-        f"format=yuv420p"
-        f"[base]",
-    ]
+    filter_parts: list[str] = []
+    use_fade_transition = fade_transition and len(background_timeline) > 1 and fade_duration > 0
+    if use_fade_transition:
+        transition_durations = resolve_transition_durations(background_timeline, fade_duration)
+        for clip_index, clip in enumerate(background_timeline):
+            clip_duration = clip.duration
+            if clip_index < len(transition_durations):
+                clip_duration += transition_durations[clip_index]
+            command.extend([
+                "-loop",
+                "1",
+                "-t",
+                f"{clip_duration:.6f}",
+                "-i",
+                str(clip.path),
+            ])
+            filter_parts.append(
+                build_background_filter(
+                    input_label=f"[{clip_index + 1}:v]",
+                    output_label=f"[bg{clip_index}]",
+                    width=width,
+                    height=height,
+                    fps=fps,
+                    duration=clip_duration,
+                )
+            )
+
+        current_label = "bg0"
+        cumulative_offset = background_timeline[0].duration
+        for clip_index in range(1, len(background_timeline)):
+            output_label = "base" if clip_index == len(background_timeline) - 1 else f"bgxf{clip_index}"
+            filter_parts.append(
+                f"[{current_label}][bg{clip_index}]"
+                f"xfade=transition=fade:duration={transition_durations[clip_index - 1]:.6f}:"
+                f"offset={cumulative_offset:.6f}[{output_label}]"
+            )
+            current_label = output_label
+            cumulative_offset += background_timeline[clip_index].duration
+    else:
+        command.extend([
+            "-f",
+            "concat",
+            "-safe",
+            "0",
+            "-i",
+            str(background_concat_file),
+        ])
+        filter_parts.append(
+            build_background_filter(
+                input_label="[1:v]",
+                output_label="[base]",
+                width=width,
+                height=height,
+                fps=fps,
+            )
+        )
 
     subtitle_path = escape_subtitles_filter_path(subtitle_file)
     filter_parts.append(f"[base]subtitles='{subtitle_path}'[vout]")
@@ -980,6 +1179,8 @@ def main() -> None:
     height = parse_positive_int("height", options["height"])
     fps = parse_positive_int("fps", options["fps"])
     words_per_scene = parse_non_negative_int("words-per-scene", options["words-per-scene"])
+    fade_transition = parse_bool("fade-transition", options["fade-transition"])
+    fade_duration = parse_non_negative_float("fade-duration", options["fade-duration"])
     seperate_text_by_seperatorline = parse_bool(
         "seperate-text-by-seperatorline",
         options["seperate-text-by-seperatorline"],
@@ -1039,6 +1240,8 @@ def main() -> None:
         print(f"Using generated images for {image_scene_count} scene(s) from {images_dir}")
     else:
         print(f"No matching scene images found in {images_dir}. Falling back to solid background.")
+    if fade_transition and fade_duration > 0:
+        print(f"Applying fade transitions with duration {fade_duration:.2f}s")
 
     concat_content = build_ffconcat_content(wav_files)
 
@@ -1051,13 +1254,24 @@ def main() -> None:
         background_concat_file = temp_path / "backgrounds.ffconcat"
         subtitle_file = temp_path / "subtitles.ass"
         concat_file.write_text(concat_content, encoding="utf-8")
-        write_solid_png_image(background_file, parse_color_rgb(background))
+        fallback_width, fallback_height = resolve_fallback_background_dimensions(
+            scene_backgrounds=scene_backgrounds,
+            width=width,
+            height=height,
+        )
+        write_solid_png_image(
+            background_file,
+            parse_color_rgb(background),
+            width=fallback_width,
+            height=fallback_height,
+        )
+        background_timeline = build_background_timeline(
+            scenes=scenes,
+            scene_backgrounds=scene_backgrounds,
+            fallback_image=background_file,
+        )
         background_concat_file.write_text(
-            build_background_ffconcat_content(
-                scenes=scenes,
-                scene_backgrounds=scene_backgrounds,
-                fallback_image=background_file,
-            ),
+            build_background_ffconcat_content(background_timeline),
             encoding="utf-8",
         )
         subtitle_file.write_text(subtitle_content, encoding="utf-8")
@@ -1065,6 +1279,7 @@ def main() -> None:
         try:
             run_ffmpeg(
                 concat_file=concat_file,
+                background_timeline=background_timeline,
                 background_concat_file=background_concat_file,
                 subtitle_file=subtitle_file,
                 output_file=output_file,
@@ -1075,6 +1290,8 @@ def main() -> None:
                 preset=preset,
                 crf=crf,
                 audio_bitrate=audio_bitrate,
+                fade_transition=fade_transition,
+                fade_duration=fade_duration,
             )
         except subprocess.CalledProcessError as exc:
             raise SystemExit(f"Error: ffmpeg failed with exit code {exc.returncode}") from exc

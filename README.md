@@ -197,7 +197,7 @@ Default behavior:
 - Arabic font: `Geeza Pro`
 - text color: white
 - background: black
-- words per scene: 10
+- words per scene: all words in the current block
 - separator-line splitting: enabled
 
 ### Video command examples
@@ -212,6 +212,12 @@ Black background, white text, 20 words per screen:
 
 ```bash
 python generate-video.py font-color=white background=black words-per-scene=20
+```
+
+Enable fade transitions between background image changes:
+
+```bash
+python generate-video.py --fade-transition
 ```
 
 Ignore `---` boundaries and chunk strictly by word count:
@@ -274,7 +280,9 @@ font-color=white
 heading-font-color=yellow
 subheading-font-color=yellow
 background=black
-words-per-scene=10
+words-per-scene=
+fade-transition=no
+fade-duration=0.5
 width=1920
 height=1080
 fps=30
@@ -293,7 +301,9 @@ Notes:
 - heading size is automatically 2x the subheading size
 - subheading size is the normal `font-size`
 - normal body text keeps the normal font and color
+- leave `words-per-scene` unset to keep each `---` block on one subtitle screen
 - `seperate-text-by-seperatorline=no` ignores `---` when deciding subtitle screen breaks
+- `--fade-transition` is also accepted as a shortcut for `fade-transition=yes`
 - `heading-color` and `subheading-color` are also accepted as aliases
 
 ## Tutorials
