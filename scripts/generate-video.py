@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import re
 import shlex
 import subprocess
@@ -39,8 +40,19 @@ DEFAULTS = {
     "codec": "libx264",
     "seperate-text-by-seperatorline": "yes",
     "limit": None,
+    "filter-threads": "1",
+    "filter-complex-threads": "1",
 }
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
+
+def resolve_project_root(default_root: Path) -> Path:
+    override = os.getenv("SEALED_NECTOR_PROJECT_ROOT", "").strip()
+    if not override:
+        return default_root
+    return Path(override).expanduser().resolve()
+
+
+PROJECT_ROOT = resolve_project_root(Path(__file__).resolve().parents[1])
 
 
 NAMED_COLORS = {
@@ -73,6 +85,8 @@ OPTION_ALIASES = {
     "image-dir": "images-dir",
     "word-per-scene": "words-per-scene",
     "fade": "fade-transition",
+    "filter_threads": "filter-threads",
+    "filter_complex_threads": "filter-complex-threads",
 }
 
 
@@ -159,6 +173,8 @@ USAGE = (
         "  codec=libx264\n"
         "  seperate-text-by-seperatorline=yes\n"
         "  limit=25\n"
+        "  filter-threads=1\n"
+        "  filter-complex-threads=1\n"
 )
 
 
@@ -1060,10 +1076,16 @@ def run_ffmpeg(
     audio_bitrate: str,
     fade_transition: bool,
     fade_duration: float,
+    filter_threads: int,
+    filter_complex_threads: int,
 ) -> None:
     command = [
         "ffmpeg",
         "-y",
+        "-filter_threads",
+        str(filter_threads),
+        "-filter_complex_threads",
+        str(filter_complex_threads),
         "-f",
         "concat",
         "-safe",
@@ -1195,6 +1217,11 @@ def main() -> None:
         options["seperate-text-by-seperatorline"],
     )
     limit = parse_limit(options["limit"])
+    filter_threads = parse_positive_int("filter-threads", options["filter-threads"])
+    filter_complex_threads = parse_positive_int(
+        "filter-complex-threads",
+        options["filter-complex-threads"],
+    )
 
     font_size_value = options["font-size"]
     font_size = (
@@ -1301,6 +1328,8 @@ def main() -> None:
                 audio_bitrate=audio_bitrate,
                 fade_transition=fade_transition,
                 fade_duration=fade_duration,
+                filter_threads=filter_threads,
+                filter_complex_threads=filter_complex_threads,
             )
         except subprocess.CalledProcessError as exc:
             raise SystemExit(f"Error: ffmpeg failed with exit code {exc.returncode}") from exc

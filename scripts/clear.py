@@ -3,11 +3,19 @@
 from __future__ import annotations
 
 import argparse
+import os
 from pathlib import Path
 import shutil
 
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
+def resolve_project_root(default_root: Path) -> Path:
+	override = os.getenv("SEALED_NECTOR_PROJECT_ROOT", "").strip()
+	if not override:
+		return default_root
+	return Path(override).expanduser().resolve()
+
+
+PROJECT_ROOT = resolve_project_root(Path(__file__).resolve().parents[1])
 OUTPUTS_ROOT = PROJECT_ROOT / "outputs"
 GENERATED_AUDIO_DIR = OUTPUTS_ROOT / "audios" / "generated"
 DESIGNED_AUDIO_DIR = OUTPUTS_ROOT / "audios" / "designed"

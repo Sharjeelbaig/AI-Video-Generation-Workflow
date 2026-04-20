@@ -13,24 +13,37 @@ from dotenv import load_dotenv
 
 
 MODEL_PATH = "@cf/stabilityai/stable-diffusion-xl-base-1.0"
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
+
+def resolve_project_root(default_root: Path) -> Path:
+    override = os.getenv("SEALED_NECTOR_PROJECT_ROOT", "").strip()
+    if not override:
+        return default_root
+    return Path(override).expanduser().resolve()
+
+
+PROJECT_ROOT = resolve_project_root(Path(__file__).resolve().parents[1])
 DEFAULTS = {
     "script": "script.txt",
     "output-dir": "outputs/images",
     "width": None,
     "height": None,
     "max-workers": None,
+    "block-indices": None,
 }
 OPTION_ALIASES = {
     "output": "output-dir",
     "workers": "max-workers",
     "image-width": "width",
     "image-height": "height",
+    "segment-indices": "block-indices",
+    "segments": "block-indices",
 }
 USAGE = (
         "Usage:\n"
         "  python generate-image.py\n"
         "  python generate-image.py width=1920 height=1080\n"
+        "  python generate-image.py block-indices=1,2,5\n"
         "\n"
         "Optional key=value arguments:\n"
         "  script=script.txt\n"
@@ -38,6 +51,7 @@ USAGE = (
         "  width=1920\n"
         "  height=1080\n"
         "  max-workers=8\n"
+        "  block-indices=1,2,5\n"
 )
 
 SCRIPT_BLOCK_SEPARATOR = "---"
@@ -100,17 +114,35 @@ def parse_optional_positive_int(name: str, value: str | None) -> int | None:
     return parse_positive_int(name, value)
 
 
+def parse_block_indices(value: str | None) -> set[int] | None:
+    if value in {None, ""}:
+        return None
+
+    indices: set[int] = set()
+    for chunk in value.split(","):
+        token = chunk.strip()
+        if not token:
+            continue
+        index = parse_positive_int("block-index", token)
+        indices.add(index)
+
+    return indices if indices else None
+
+
 def clean_prompt(value: str) -> str:
     return " ".join(TAG_RE.sub(" ", value).split())
 
 
-def load_prompts(script_path: Path) -> list[ImagePrompt]:
+def load_prompts(script_path: Path, block_indices: set[int] | None = None) -> list[ImagePrompt]:
     if not script_path.exists():
         fail(f"Script file not found: {script_path}")
 
     script_content = script_path.read_text(encoding="utf-8")
     prompts: list[ImagePrompt] = []
     for block_index, block_text in enumerate(script_content.split(SCRIPT_BLOCK_SEPARATOR), start=1):
+        if block_indices is not None and block_index not in block_indices:
+            continue
+
         cleaned_block_prompts = [
             clean_prompt(prompt_text)
             for prompt_text in IMAGE_BLOCK_TAG_RE.findall(block_text)
@@ -251,11 +283,15 @@ def main() -> None:
     script_path = resolve_path(options["script"], DEFAULTS["script"])
     output_dir = resolve_path(options["output-dir"], DEFAULTS["output-dir"])
 
+    block_indices = parse_block_indices(options["block-indices"])
+    if block_indices is None:
+        block_indices = parse_block_indices(os.getenv("IMAGE_BLOCK_INDICES", "").strip() or None)
+
     load_dotenv()
     width, height = resolve_dimensions(options)
 
     url, headers = get_api_context()
-    prompts = load_prompts(script_path)
+    prompts = load_prompts(script_path, block_indices=block_indices)
 
     if not prompts:
         fail(f"No <image>...</image> prompts found in {script_path}")
@@ -264,6 +300,9 @@ def main() -> None:
 
     max_workers = resolve_max_workers(len(prompts), options["max-workers"])
     print(f"Found {len(prompts)} image prompt block(s) in {script_path}")
+    if block_indices is not None:
+        requested_indices = ", ".join(str(index) for index in sorted(block_indices))
+        print(f"Requested block indices: {requested_indices}")
     print(f"Generating in parallel with {max_workers} concurrent request(s)")
     if width is not None and height is not None:
         print(f"Requested output dimensions: {width}x{height}")

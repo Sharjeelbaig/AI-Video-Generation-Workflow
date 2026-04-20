@@ -490,3 +490,20 @@ For word-count-only subtitle chunking:
 ```bash
 python generate-video.py words-per-scene=20 seperate-text-by-seperatorline=no
 ```
+
+## Running The UI
+
+### Terminal 1: Backend
+
+```bash
+uv run uvicorn backend.main:app --reload --host 127.0.0.1 --port 8000
+```
+
+### Terminal 2: Frontend
+
+```bash
+cd client
+npm i
+npm run dev
+```
+
