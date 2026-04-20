@@ -38,6 +38,9 @@ export interface ScriptSegment {
   heading: string | null;
   subHeading: string | null;
   imagePrompt: string | null;
+  sourceBlockIndex: number;
+  imagePromptSourceBlockIndex: number | null;
+  hasNarration: boolean;
   warnings: string[];
   isEmpty: boolean;
 }
@@ -52,7 +55,7 @@ export interface VoiceDesign {
   tonePreset: TonePreset;
   narrationMood: NarrationMood;
   createdAt: string;
-  duration: number;
+  duration: number | null;
   status: JobStatus;
   audioUrl: string | null;
   isDefault: boolean;
@@ -70,6 +73,8 @@ export interface GeneratedAudio {
   duration: number | null;
   createdAt: string;
   runId: string;
+  parserVersion?: number | null;
+  scriptFingerprint?: string | null;
 }
 
 export interface GeneratedImage {
@@ -85,6 +90,9 @@ export interface GeneratedImage {
   height: number;
   createdAt: string;
   runId: string;
+  parserVersion?: number | null;
+  scriptFingerprint?: string | null;
+  promptBlockIndex?: number | null;
 }
 
 export interface GeneratedVideo {
@@ -100,6 +108,8 @@ export interface GeneratedVideo {
   createdAt: string;
   runId: string;
   settings: VideoSettings;
+  parserVersion?: number | null;
+  scriptFingerprint?: string | null;
 }
 
 export interface VideoStage {

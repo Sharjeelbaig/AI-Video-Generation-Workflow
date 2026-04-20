@@ -54,6 +54,8 @@ DEFAULT_REF_TEXT = (
 )
 
 TAG_RE = re.compile(r"<[^>]*>")
+HEADING_BLOCK_RE = re.compile(r"<\s*heading\s*>.*?<\s*/\s*heading\s*>", re.IGNORECASE | re.DOTALL)
+SUBHEADING_BLOCK_RE = re.compile(r"<\s*subheading\s*>.*?<\s*/\s*subheading\s*>", re.IGNORECASE | re.DOTALL)
 IMAGE_BLOCK_TAG_RE = re.compile(r"<\s*image\s*>.*?<\s*/\s*image\s*>", re.IGNORECASE | re.DOTALL)
 ARABIC_CHAR_RE = re.compile(r"[\u0600-\u06FF\u0750-\u077F\u08A0-\u08FF\uFB50-\uFDFF\uFE70-\uFEFF]")
 LATIN_CHAR_RE = re.compile(r"[A-Za-z]")
@@ -124,8 +126,25 @@ def parse_segment_indices(value: str | None) -> set[int] | None:
 
 
 def clean_tts_text(value: str) -> str:
-    without_image_prompts = IMAGE_BLOCK_TAG_RE.sub(" ", value)
+    without_heading = HEADING_BLOCK_RE.sub(" ", value)
+    without_subheading = SUBHEADING_BLOCK_RE.sub(" ", without_heading)
+    without_image_prompts = IMAGE_BLOCK_TAG_RE.sub(" ", without_subheading)
     return " ".join(TAG_RE.sub(" ", without_image_prompts).split())
+
+
+def normalized_spoken_segments(script_text: str) -> list[str]:
+    segments: list[str] = []
+    raw_blocks = [
+        block
+        for block in (piece.strip() for piece in re.split(r"^---$", script_text, flags=re.MULTILINE))
+        if block
+    ]
+    for raw_block in raw_blocks:
+        cleaned_text = clean_tts_text(raw_block)
+        if not cleaned_text:
+            continue
+        segments.append(cleaned_text)
+    return segments
 
 
 def preview_text(value: str, limit: int = 80) -> str:
@@ -264,13 +283,11 @@ def main() -> None:
     text = script_path.read_text(encoding="utf-8")
     model = load(MODEL_ID)
 
-    generated_count = 0
-    for index, piece in enumerate(text.split("---")):
-        if segment_indices is not None and index not in segment_indices:
-            continue
+    spoken_segments = normalized_spoken_segments(text)
 
-        cleaned_piece = clean_tts_text(piece)
-        if not cleaned_piece:
+    generated_count = 0
+    for index, cleaned_piece in enumerate(spoken_segments):
+        if segment_indices is not None and index not in segment_indices:
             continue
 
         generate_segment_audio(

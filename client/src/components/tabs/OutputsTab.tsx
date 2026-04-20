@@ -18,6 +18,7 @@ import Tooltip from '@mui/material/Tooltip';
 import Tabs from '@mui/material/Tabs';
 import Tab from '@mui/material/Tab';
 import Grid from '@mui/material/Grid';
+import Chip from '@mui/material/Chip';
 import { alpha } from '@mui/material/styles';
 import SearchIcon from '@mui/icons-material/Search';
 import PlayArrowIcon from '@mui/icons-material/PlayArrow';
@@ -33,6 +34,11 @@ import EmptyState from '../common/EmptyState';
 import ConfirmDialog from '../common/ConfirmDialog';
 import { useApp } from '../../store/AppContext';
 import { mockApi } from '../../services/mockApi';
+import {
+  formatOptionalRoundedSeconds,
+  formatOptionalSeconds,
+  isStaleOutputRecord,
+} from '../../utils/outputStability';
 
 interface Props {
   project: Project;
@@ -54,6 +60,10 @@ function timeAgo(iso: string): string {
 
 export default function OutputsTab({ project, voiceDesigns, audios, images, videos }: Props) {
   const { dispatch, toast } = useApp();
+  const safeVoiceDesigns = Array.isArray(voiceDesigns) ? voiceDesigns : [];
+  const safeAudios = Array.isArray(audios) ? audios : [];
+  const safeImages = Array.isArray(images) ? images : [];
+  const safeVideos = Array.isArray(videos) ? videos : [];
   const [tabIdx, setTabIdx] = useState(0);
   const [search, setSearch] = useState('');
   const [statusFilter, setStatusFilter] = useState('all');
@@ -61,31 +71,31 @@ export default function OutputsTab({ project, voiceDesigns, audios, images, vide
   const [deleteTarget, setDeleteTarget] = useState<{ type: string; id: string; label: string } | null>(null);
 
   const tabData = [
-    { label: 'Voice Designs', icon: RecordVoiceOverOutlinedIcon, count: voiceDesigns.length },
-    { label: 'Audios', icon: GraphicEqIcon, count: audios.length },
-    { label: 'Images', icon: ImageOutlinedIcon, count: images.length },
-    { label: 'Videos', icon: MovieOutlinedIcon, count: videos.length },
+    { label: 'Voice Designs', icon: RecordVoiceOverOutlinedIcon, count: safeVoiceDesigns.length },
+    { label: 'Audios', icon: GraphicEqIcon, count: safeAudios.length },
+    { label: 'Images', icon: ImageOutlinedIcon, count: safeImages.length },
+    { label: 'Videos', icon: MovieOutlinedIcon, count: safeVideos.length },
   ];
 
-  const filteredVoices = useMemo(() => voiceDesigns.filter(v =>
+  const filteredVoices = useMemo(() => safeVoiceDesigns.filter(v =>
     (!search || v.name.toLowerCase().includes(search.toLowerCase())) &&
     (statusFilter === 'all' || v.status === statusFilter)
-  ), [voiceDesigns, search, statusFilter]);
+  ), [safeVoiceDesigns, search, statusFilter]);
 
-  const filteredAudios = useMemo(() => audios.filter(a =>
+  const filteredAudios = useMemo(() => safeAudios.filter(a =>
     (!search || String(a.segmentIndex + 1).includes(search)) &&
     (statusFilter === 'all' || a.status === statusFilter)
-  ), [audios, search, statusFilter]);
+  ), [safeAudios, search, statusFilter]);
 
-  const filteredImages = useMemo(() => images.filter(i =>
+  const filteredImages = useMemo(() => safeImages.filter(i =>
     (!search || i.prompt.toLowerCase().includes(search.toLowerCase()) || String(i.segmentIndex + 1).includes(search)) &&
     (statusFilter === 'all' || i.status === statusFilter)
-  ), [images, search, statusFilter]);
+  ), [safeImages, search, statusFilter]);
 
-  const filteredVideos = useMemo(() => videos.filter(v =>
+  const filteredVideos = useMemo(() => safeVideos.filter(v =>
     (!search || v.filename.toLowerCase().includes(search.toLowerCase())) &&
     (statusFilter === 'all' || v.status === statusFilter)
-  ), [videos, search, statusFilter]);
+  ), [safeVideos, search, statusFilter]);
 
   const toggleSelect = (id: string) => {
     setSelected(prev => {
@@ -201,7 +211,7 @@ export default function OutputsTab({ project, voiceDesigns, audios, images, vide
                           <StatusChip status={vd.status} />
                         </Stack>
                         <Typography variant="caption" color="text.secondary">
-                          {vd.tonePreset} · {vd.narrationMood} · {vd.duration.toFixed(1)}s · {timeAgo(vd.createdAt)}
+                          {vd.tonePreset} · {vd.narrationMood} · {formatOptionalSeconds(vd.duration)} · {timeAgo(vd.createdAt)}
                         </Typography>
                       </Box>
                       <Stack direction="row">
@@ -234,9 +244,12 @@ export default function OutputsTab({ project, voiceDesigns, audios, images, vide
                         <Stack direction="row" alignItems="center" spacing={1} mb={0.25}>
                           <Typography variant="body2" fontWeight={700}>Segment #{a.segmentIndex + 1}</Typography>
                           <StatusChip status={a.status} />
+                          {isStaleOutputRecord(a, project.scriptContent) && (
+                            <Chip label="Stale" size="small" color="warning" sx={{ height: 18, fontSize: '0.62rem' }} />
+                          )}
                         </Stack>
                         <Typography variant="caption" color="text.secondary">
-                          {a.duration ? `${a.duration.toFixed(1)}s` : '—'} · {timeAgo(a.createdAt)} · Run: {a.runId.slice(-6)}
+                          {formatOptionalSeconds(a.duration)} · {timeAgo(a.createdAt)} · Run: {a.runId.slice(-6)}
                         </Typography>
                       </Box>
                       <Stack direction="row">
@@ -280,7 +293,12 @@ export default function OutputsTab({ project, voiceDesigns, audios, images, vide
                           sx={{ bgcolor: t => alpha(t.palette.background.paper, 0.8), borderRadius: 1, p: 0.25 }} />
                       </Box>
                       <Box sx={{ position: 'absolute', top: 6, right: 6 }}>
-                        <StatusChip status={img.status} />
+                        <Stack direction="row" spacing={0.5} alignItems="center">
+                          {isStaleOutputRecord(img, project.scriptContent) && (
+                            <Chip label="Stale" size="small" color="warning" sx={{ height: 18, fontSize: '0.62rem' }} />
+                          )}
+                          <StatusChip status={img.status} />
+                        </Stack>
                       </Box>
                     </Box>
                     <CardContent sx={{ p: 1.5, '&:last-child': { pb: 1.5 } }}>
@@ -325,10 +343,15 @@ export default function OutputsTab({ project, voiceDesigns, audios, images, vide
                         <Box>
                           <Typography variant="body2" fontWeight={700}>{v.filename}</Typography>
                           <Typography variant="caption" color="text.secondary">
-                            {v.duration ? `${Math.round(v.duration)}s` : '—'} · {timeAgo(v.createdAt)}
+                            {formatOptionalRoundedSeconds(v.duration)} · {timeAgo(v.createdAt)}
                           </Typography>
                         </Box>
-                        <StatusChip status={v.status} />
+                        <Stack direction="row" spacing={0.5} alignItems="center">
+                          {isStaleOutputRecord(v, project.scriptContent) && (
+                            <Chip label="Stale" size="small" color="warning" sx={{ height: 18, fontSize: '0.62rem' }} />
+                          )}
+                          <StatusChip status={v.status} />
+                        </Stack>
                       </Stack>
                       <Stack direction="row" spacing={0.5}>
                         <Checkbox size="small" checked={selected.has(v.id)} onChange={() => toggleSelect(v.id)} />

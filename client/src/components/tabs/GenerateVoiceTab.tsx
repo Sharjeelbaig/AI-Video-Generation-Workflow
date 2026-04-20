@@ -27,6 +27,12 @@ import ConfirmDialog from '../common/ConfirmDialog';
 import { mockApi, generateId } from '../../services/mockApi';
 import { useApp } from '../../store/AppContext';
 import { parseScript } from '../../services/scriptParser';
+import {
+  formatOptionalSeconds,
+  getPreferredOutputForSegment,
+  isStaleOutputRecord,
+  partitionFreshOutputs,
+} from '../../utils/outputStability';
 
 interface Props {
   project: Project;
@@ -45,6 +51,7 @@ export default function GenerateVoiceTab({ project, designedVoices = [], audios 
   const safeDesignedVoices = Array.isArray(designedVoices) ? designedVoices : [];
   const safeAudios = Array.isArray(audios) ? audios : [];
   const segments = parseScript(project.scriptContent, project.id);
+  const { stale: staleAudios } = partitionFreshOutputs(safeAudios, project.scriptContent);
 
   useEffect(() => {
     if (safeDesignedVoices.length === 0) {
@@ -60,8 +67,9 @@ export default function GenerateVoiceTab({ project, designedVoices = [], audios 
     }
   }, [safeDesignedVoices, selectedVoiceId]);
 
-  const getAudioForSegment = useCallback((idx: number) =>
-    safeAudios.find(a => a.segmentIndex === idx), [safeAudios]);
+  const getAudioStateForSegment = useCallback((idx: number) => (
+    getPreferredOutputForSegment(safeAudios, idx, project.scriptContent)
+  ), [project.scriptContent, safeAudios]);
 
   const toggleSelect = (idx: number) => {
     setSelected(prev => {
@@ -105,7 +113,9 @@ export default function GenerateVoiceTab({ project, designedVoices = [], audios 
           });
         }
       );
-      const existing = safeAudios.find(a => a.segmentIndex === idx);
+      const existing = safeAudios.find(a => (
+        a.segmentIndex === idx && !isStaleOutputRecord(a, project.scriptContent)
+      ));
       dispatch({
         type: 'UPDATE_AUDIO', projectId: project.id,
         payload: { ...audio, id: existing?.id || audio.id },
@@ -157,7 +167,10 @@ export default function GenerateVoiceTab({ project, designedVoices = [], audios 
   };
 
   const handleRetryFailed = async () => {
-    const failed = segments.filter(s => getAudioForSegment(s.index)?.status === 'failed');
+    const failed = segments.filter((segment) => {
+      const { record, stale } = getAudioStateForSegment(segment.index);
+      return !stale && record?.status === 'failed';
+    });
     if (failed.length === 0) { toast('No failed segments to retry', 'info'); return; }
     const runId = generateId('run');
     const run = mockApi.createRunJob(project.id, 'generate-voice', `Retry ${failed.length} failed segments`, failed.map(s => s.id));
@@ -181,7 +194,10 @@ export default function GenerateVoiceTab({ project, designedVoices = [], audios 
     }
   };
 
-  const failedCount = segments.filter(s => getAudioForSegment(s.index)?.status === 'failed').length;
+  const failedCount = segments.filter((segment) => {
+    const { record, stale } = getAudioStateForSegment(segment.index);
+    return !stale && record?.status === 'failed';
+  }).length;
   const anyRunning = running.size > 0;
 
   if (segments.length === 0) {
@@ -221,6 +237,13 @@ export default function GenerateVoiceTab({ project, designedVoices = [], audios 
         </Alert>
       )}
 
+      {staleAudios.length > 0 && (
+        <Alert severity="warning" sx={{ mb: 2 }}>
+          {staleAudios.length} generated audio asset{staleAudios.length > 1 ? 's are' : ' is'} from an older
+          script/parser state and will not be reused until regenerated.
+        </Alert>
+      )}
+
       <Stack direction="row" spacing={2} alignItems="center" mb={3}>
         <FormControl size="small" sx={{ minWidth: 240 }}>
           <InputLabel>Designed Voice</InputLabel>
@@ -241,7 +264,7 @@ export default function GenerateVoiceTab({ project, designedVoices = [], audios 
 
       <Stack spacing={1.5}>
         {segments.map(seg => {
-          const audio = getAudioForSegment(seg.index);
+          const { record: audio, stale } = getAudioStateForSegment(seg.index);
           const isRunning = running.has(seg.index);
           const prog = progress[seg.index] ?? (audio?.progress ?? 0);
           const status = isRunning ? 'running' : (audio?.status ?? 'idle');
@@ -265,11 +288,14 @@ export default function GenerateVoiceTab({ project, designedVoices = [], audios 
                       <Stack direction="row" alignItems="center" spacing={1}>
                         <Typography variant="caption" fontWeight={700} sx={{ color: 'primary.main' }}>#{seg.index + 1}</Typography>
                         {seg.heading && <Chip label={seg.heading} size="small" sx={{ height: 18, fontSize: '0.62rem', maxWidth: 150 }} />}
+                        {stale && !isRunning && (
+                          <Chip label="Stale" size="small" color="warning" sx={{ height: 18, fontSize: '0.62rem' }} />
+                        )}
                       </Stack>
                       <Stack direction="row" alignItems="center" spacing={0.5}>
                         <StatusChip status={status} />
-                        {audio?.duration && (
-                          <Typography variant="caption" color="text.secondary">{audio.duration.toFixed(1)}s</Typography>
+                        {audio && (
+                          <Typography variant="caption" color="text.secondary">{formatOptionalSeconds(audio.duration)}</Typography>
                         )}
                         {audio && status === 'success' && (
                           <>

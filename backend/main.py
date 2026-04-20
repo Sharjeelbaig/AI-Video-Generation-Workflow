@@ -12,6 +12,7 @@ import shutil
 import sqlite3
 import subprocess
 import sys
+import tempfile
 import uuid
 import wave
 from typing import Any, Literal
@@ -33,6 +34,7 @@ PROJECT_OUTPUTS_ROOT = OUTPUTS_ROOT / "projects"
 
 PROJECT_TABLE = "projects"
 ENTITY_TABLES = {"runs", "voice_designs", "audios", "images", "videos"}
+SCRIPT_PARSER_VERSION = 2
 
 
 ProjectStatus = Literal["idle", "running", "success", "failed", "archived"]
@@ -61,6 +63,14 @@ def create_id(prefix: str) -> str:
 def slugify(value: str, fallback: str = "voice") -> str:
     normalized = re.sub(r"[^a-z0-9]+", "_", value.lower()).strip("_")
     return normalized or fallback
+
+
+def compute_script_fingerprint(content: str) -> str:
+    digest = 0x811C9DC5
+    for byte in content.encode("utf-8"):
+        digest ^= byte
+        digest = (digest * 0x01000193) & 0xFFFFFFFF
+    return f"{digest:08x}"
 
 
 class VideoSettings(BaseModel):
@@ -105,6 +115,9 @@ class ScriptSegment(BaseModel):
     heading: str | None = None
     subHeading: str | None = None
     imagePrompt: str | None = None
+    sourceBlockIndex: int
+    imagePromptSourceBlockIndex: int | None = None
+    hasNarration: bool = False
     warnings: list[str] = Field(default_factory=list)
     isEmpty: bool
 
@@ -145,6 +158,8 @@ class GeneratedAudio(BaseModel):
     duration: float | None = None
     createdAt: str
     runId: str
+    parserVersion: int | None = None
+    scriptFingerprint: str | None = None
 
 
 class GeneratedImage(BaseModel):
@@ -160,6 +175,9 @@ class GeneratedImage(BaseModel):
     height: int
     createdAt: str
     runId: str
+    parserVersion: int | None = None
+    scriptFingerprint: str | None = None
+    promptBlockIndex: int | None = None
 
 
 class VideoStage(BaseModel):
@@ -181,6 +199,8 @@ class GeneratedVideo(BaseModel):
     createdAt: str
     runId: str
     settings: VideoSettings
+    parserVersion: int | None = None
+    scriptFingerprint: str | None = None
 
 
 class RunJob(BaseModel):
@@ -488,18 +508,18 @@ class RunEventBroker:
 
 
 def extract_tag(text: str, tag: str) -> str | None:
-    match = re.search(rf"<{tag}>([\\s\\S]*?)</{tag}>", text, flags=re.IGNORECASE)
+    match = re.search(rf"<{tag}>([\s\S]*?)</{tag}>", text, flags=re.IGNORECASE)
     if not match:
         return None
     return match.group(1).strip() or None
 
 
 def strip_tags(text: str) -> str:
-    stripped = re.sub(r"<Heading>[\\s\\S]*?</Heading>", "", text, flags=re.IGNORECASE)
-    stripped = re.sub(r"<SubHeading>[\\s\\S]*?</SubHeading>", "", stripped, flags=re.IGNORECASE)
-    stripped = re.sub(r"<image>[\\s\\S]*?</image>", "", stripped, flags=re.IGNORECASE)
+    stripped = re.sub(r"<Heading>[\s\S]*?</Heading>", "", text, flags=re.IGNORECASE)
+    stripped = re.sub(r"<SubHeading>[\s\S]*?</SubHeading>", "", stripped, flags=re.IGNORECASE)
+    stripped = re.sub(r"<image>[\s\S]*?</image>", "", stripped, flags=re.IGNORECASE)
     stripped = re.sub(r"<[^>]+>", "", stripped)
-    return stripped.strip()
+    return " ".join(stripped.split())
 
 
 def detect_warnings(raw_text: str, clean_text: str) -> list[str]:
@@ -507,38 +527,99 @@ def detect_warnings(raw_text: str, clean_text: str) -> list[str]:
     if not clean_text and not extract_tag(raw_text, "Heading") and not extract_tag(raw_text, "SubHeading"):
         warnings.append("Segment has no visible text")
 
-    unclosed_matches = re.findall(r"<[A-Za-z]+(?![^>]*/>)[^>]*>(?![\\s\\S]*</)", raw_text)
-    if unclosed_matches:
-        warnings.append(f"Possible unclosed tag: {unclosed_matches[0]}")
+    for tag in ("Heading", "SubHeading", "image"):
+        open_count = len(re.findall(rf"<{tag}>", raw_text, flags=re.IGNORECASE))
+        close_count = len(re.findall(rf"</{tag}>", raw_text, flags=re.IGNORECASE))
+        if open_count != close_count:
+            warnings.append(f"Mismatched <{tag}> tag count")
     return warnings
 
 
 def parse_script(content: str, project_id: str) -> list[ScriptSegment]:
-    chunks = [chunk.strip() for chunk in re.split(r"^---$", content, flags=re.MULTILINE)]
-    raw_segments = [chunk for chunk in chunks if chunk]
-
+    raw_segments = [
+        chunk
+        for chunk in (segment.strip() for segment in re.split(r"^---$", content, flags=re.MULTILINE))
+        if chunk
+    ]
     segments: list[ScriptSegment] = []
-    for index, raw_segment in enumerate(raw_segments):
+    pending_heading: str | None = None
+    pending_sub_heading: str | None = None
+    pending_image_prompt: str | None = None
+    pending_image_prompt_source_index: int | None = None
+    pending_warnings: list[str] = []
+
+    for source_block_index, raw_segment in enumerate(raw_segments):
         heading = extract_tag(raw_segment, "Heading")
         sub_heading = extract_tag(raw_segment, "SubHeading")
         image_prompt = extract_tag(raw_segment, "image")
         clean_text = strip_tags(raw_segment)
         warnings = detect_warnings(raw_segment, clean_text)
 
+        if not clean_text:
+            if heading:
+                if pending_heading:
+                    pending_warnings.append("Multiple standalone headings found before narration; using the last one")
+                pending_heading = heading
+            if sub_heading:
+                if pending_sub_heading:
+                    pending_warnings.append("Multiple standalone subheadings found before narration; using the last one")
+                pending_sub_heading = sub_heading
+            if image_prompt:
+                if pending_image_prompt:
+                    pending_warnings.append("Multiple standalone image prompts found before narration; using the last one")
+                pending_image_prompt = image_prompt
+                pending_image_prompt_source_index = source_block_index
+            pending_warnings.extend(
+                warning for warning in warnings if warning != "Segment has no visible text"
+            )
+            continue
+
+        uses_pending_image_prompt = not image_prompt and pending_image_prompt is not None
+        segment_warnings = [*pending_warnings, *warnings]
+        if image_prompt and pending_image_prompt:
+            segment_warnings.append("Inline image prompt overrides the previous standalone image prompt")
+
         segments.append(
             ScriptSegment(
-                id=f"{project_id}_seg_{index}",
+                id=f"{project_id}_seg_{len(segments)}",
                 projectId=project_id,
-                index=index,
+                index=len(segments),
                 rawText=raw_segment,
                 cleanText=clean_text,
-                heading=heading,
-                subHeading=sub_heading,
-                imagePrompt=image_prompt,
-                warnings=warnings,
-                isEmpty=not clean_text and not heading and not sub_heading,
+                heading=heading or pending_heading,
+                subHeading=sub_heading or pending_sub_heading,
+                imagePrompt=image_prompt or pending_image_prompt,
+                sourceBlockIndex=source_block_index,
+                imagePromptSourceBlockIndex=(
+                    source_block_index
+                    if image_prompt
+                    else pending_image_prompt_source_index
+                    if uses_pending_image_prompt
+                    else None
+                ),
+                hasNarration=True,
+                warnings=segment_warnings,
+                isEmpty=False,
             )
         )
+
+        pending_heading = None
+        pending_sub_heading = None
+        pending_image_prompt = None
+        pending_image_prompt_source_index = None
+        pending_warnings = []
+
+    if (pending_heading or pending_sub_heading or pending_image_prompt) and segments:
+        last_segment = segments[-1]
+        segments[-1] = last_segment.model_copy(
+            update={
+                "warnings": [
+                    *last_segment.warnings,
+                    "Trailing standalone script block was ignored because no narration followed it",
+                ]
+            }
+        )
+
     return segments
 
 
@@ -910,6 +991,70 @@ def list_voice_design_models(project_id: str) -> list[VoiceDesign]:
     return [item for item in load_valid_entities("voice_designs", project_id, VoiceDesign) if isinstance(item, VoiceDesign)]
 
 
+def list_generated_audio_models(project_id: str) -> list[GeneratedAudio]:
+    return [item for item in load_valid_entities("audios", project_id, GeneratedAudio) if isinstance(item, GeneratedAudio)]
+
+
+def list_generated_image_models(project_id: str) -> list[GeneratedImage]:
+    return [item for item in load_valid_entities("images", project_id, GeneratedImage) if isinstance(item, GeneratedImage)]
+
+
+def list_generated_video_models(project_id: str) -> list[GeneratedVideo]:
+    return [item for item in load_valid_entities("videos", project_id, GeneratedVideo) if isinstance(item, GeneratedVideo)]
+
+
+def output_matches_current_script(record: Any, script_fingerprint: str) -> bool:
+    return (
+        getattr(record, "parserVersion", None) == SCRIPT_PARSER_VERSION
+        and getattr(record, "scriptFingerprint", None) == script_fingerprint
+    )
+
+
+def asset_exists_for_url(project_id: str, asset_url: str | None) -> bool:
+    asset_path = local_path_from_asset_url(project_id, asset_url)
+    return asset_path is not None and asset_path.exists()
+
+
+def current_audio_records_by_segment(project: Project, script_fingerprint: str) -> dict[int, GeneratedAudio]:
+    current_records: dict[int, GeneratedAudio] = {}
+    for audio in list_generated_audio_models(project.id):
+        if audio.segmentIndex in current_records:
+            continue
+        if audio.status != "success":
+            continue
+        if not output_matches_current_script(audio, script_fingerprint):
+            continue
+        if not asset_exists_for_url(project.id, audio.audioUrl):
+            continue
+        current_records[audio.segmentIndex] = audio
+    return current_records
+
+
+def current_image_records_by_segment(project: Project, script_fingerprint: str) -> dict[int, GeneratedImage]:
+    current_records: dict[int, GeneratedImage] = {}
+    for image in list_generated_image_models(project.id):
+        if image.segmentIndex in current_records:
+            continue
+        if image.status != "success":
+            continue
+        if not output_matches_current_script(image, script_fingerprint):
+            continue
+        if not asset_exists_for_url(project.id, image.thumbnailUrl):
+            continue
+        current_records[image.segmentIndex] = image
+    return current_records
+
+
+def link_or_copy_file(source: Path, target: Path) -> None:
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if target.exists():
+        target.unlink()
+    try:
+        target.symlink_to(source)
+    except OSError:
+        shutil.copy2(source, target)
+
+
 def unset_default_voice_designs(project_id: str, except_id: str) -> None:
     existing_designs = list_voice_design_models(project_id)
     for voice_design in existing_designs:
@@ -1007,19 +1152,21 @@ async def run_audio_generation_pipeline(
 ) -> None:
     try:
         project = set_project_status(project_id, "running")
+        script_fingerprint = compute_script_fingerprint(project.scriptContent)
         segments = parse_script(project.scriptContent, project_id)
         if not segments:
-            raise RuntimeError("No script segments available. Save script content first.")
+            raise RuntimeError("No spoken script segments are available. Add narration to the script first.")
 
         all_indices = sorted(segment.index for segment in segments)
         requested_indices = sorted(set(request.segmentIndices or all_indices))
 
         segment_by_index = {segment.index: segment for segment in segments}
-        existing_audios = [
-            GeneratedAudio.model_validate(item)
-            for item in store.list_entities("audios", project_id)
-        ]
-        existing_by_index = {audio.segmentIndex: audio for audio in existing_audios}
+        existing_by_index: dict[int, GeneratedAudio] = {}
+        for audio in list_generated_audio_models(project_id):
+            if not output_matches_current_script(audio, script_fingerprint):
+                continue
+            if audio.segmentIndex not in existing_by_index:
+                existing_by_index[audio.segmentIndex] = audio
 
         reference_text: str | None = None
         selected_reference_id: str | None = None
@@ -1084,6 +1231,8 @@ async def run_audio_generation_pipeline(
                 duration=None,
                 createdAt=now_iso(),
                 runId=run.id,
+                parserVersion=SCRIPT_PARSER_VERSION,
+                scriptFingerprint=script_fingerprint,
             )
             store.upsert_entity("audios", project_id, running_audio.id, running_audio.model_dump())
             await publish_run_event(run.id, "audio-update", {"audio": running_audio.model_dump()})
@@ -1147,6 +1296,8 @@ async def run_audio_generation_pipeline(
                     duration=None,
                     createdAt=now_iso(),
                     runId=run.id,
+                    parserVersion=SCRIPT_PARSER_VERSION,
+                    scriptFingerprint=script_fingerprint,
                 )
                 store.upsert_entity("audios", project_id, failed_audio.id, failed_audio.model_dump())
                 await publish_run_event(run.id, "audio-update", {"audio": failed_audio.model_dump()})
@@ -1164,6 +1315,8 @@ async def run_audio_generation_pipeline(
                 duration=read_duration_seconds(audio_file),
                 createdAt=now_iso(),
                 runId=run.id,
+                parserVersion=SCRIPT_PARSER_VERSION,
+                scriptFingerprint=script_fingerprint,
             )
             store.upsert_entity("audios", project_id, completed_audio.id, completed_audio.model_dump())
             await publish_run_event(run.id, "audio-update", {"audio": completed_audio.model_dump()})
@@ -1188,6 +1341,7 @@ async def run_image_generation_pipeline(
 ) -> None:
     try:
         project = set_project_status(project_id, "running")
+        script_fingerprint = compute_script_fingerprint(project.scriptContent)
         segments = parse_script(project.scriptContent, project_id)
 
         prompt_segments = [segment for segment in segments if segment.imagePrompt]
@@ -1204,12 +1358,18 @@ async def run_image_generation_pipeline(
             raise RuntimeError("No target segments with image prompts were selected")
 
         set_project_status(project_id, "running")
-        existing_images = [
-            GeneratedImage.model_validate(item)
-            for item in store.list_entities("images", project_id)
-        ]
-        existing_by_index = {image.segmentIndex: image for image in existing_images}
-        target_indices = sorted(segment.index for segment in target_segments)
+        existing_by_index: dict[int, GeneratedImage] = {}
+        for image in list_generated_image_models(project_id):
+            if not output_matches_current_script(image, script_fingerprint):
+                continue
+            if image.segmentIndex not in existing_by_index:
+                existing_by_index[image.segmentIndex] = image
+        block_index_to_segment_index = {
+            (segment.imagePromptSourceBlockIndex or 0) + 1: segment.index
+            for segment in target_segments
+            if segment.imagePromptSourceBlockIndex is not None
+        }
+        target_block_indices = sorted(block_index_to_segment_index)
 
         for segment in target_segments:
             previous_image = existing_by_index.get(segment.index)
@@ -1226,6 +1386,9 @@ async def run_image_generation_pipeline(
                 height=request.height or project.videoSettings.height,
                 createdAt=now_iso(),
                 runId=run.id,
+                parserVersion=SCRIPT_PARSER_VERSION,
+                scriptFingerprint=script_fingerprint,
+                promptBlockIndex=segment.imagePromptSourceBlockIndex,
             )
             store.upsert_entity("images", project_id, running_image.id, running_image.model_dump())
             await publish_run_event(run.id, "image-update", {"image": running_image.model_dump()})
@@ -1235,7 +1398,7 @@ async def run_image_generation_pipeline(
         script_args = [
             f"script={get_script_path(project_id)}",
             f"output-dir={target_image_dir}",
-            f"block-indices={','.join(str(index + 1) for index in target_indices)}",
+            f"block-indices={','.join(str(index) for index in target_block_indices)}",
         ]
         if request.width is not None and request.height is not None:
             script_args.extend([f"width={request.width}", f"height={request.height}"])
@@ -1254,8 +1417,8 @@ async def run_image_generation_pipeline(
             if not match:
                 return
             block_index = int(match.group(1))
-            segment_index = block_index - 1
-            if segment_index not in target_indices:
+            segment_index = block_index_to_segment_index.get(block_index)
+            if segment_index is None:
                 return
             state = match.group(2).lower()
             await publish_run_event(
@@ -1279,7 +1442,8 @@ async def run_image_generation_pipeline(
         failures = 0
         for segment in target_segments:
             previous_image = existing_by_index.get(segment.index)
-            image_file = generated_files.get(segment.index + 1)
+            prompt_block_index = segment.imagePromptSourceBlockIndex
+            image_file = generated_files.get(prompt_block_index + 1) if prompt_block_index is not None else None
             if image_file is None:
                 failures += 1
                 failed_image = GeneratedImage(
@@ -1295,6 +1459,9 @@ async def run_image_generation_pipeline(
                     height=request.height or project.videoSettings.height,
                     createdAt=now_iso(),
                     runId=run.id,
+                    parserVersion=SCRIPT_PARSER_VERSION,
+                    scriptFingerprint=script_fingerprint,
+                    promptBlockIndex=segment.imagePromptSourceBlockIndex,
                 )
                 store.upsert_entity("images", project_id, failed_image.id, failed_image.model_dump())
                 await publish_run_event(run.id, "image-update", {"image": failed_image.model_dump()})
@@ -1313,6 +1480,9 @@ async def run_image_generation_pipeline(
                 height=request.height or project.videoSettings.height,
                 createdAt=now_iso(),
                 runId=run.id,
+                parserVersion=SCRIPT_PARSER_VERSION,
+                scriptFingerprint=script_fingerprint,
+                promptBlockIndex=segment.imagePromptSourceBlockIndex,
             )
             store.upsert_entity("images", project_id, success_image.id, success_image.model_dump())
             await publish_run_event(run.id, "image-update", {"image": success_image.model_dump()})
@@ -1393,6 +1563,7 @@ async def run_video_generation_pipeline(
         updated_project = project.model_copy(update={"videoSettings": settings, "updatedAt": now_iso()})
         store.upsert_project(updated_project)
         project = ensure_project_output_layout(updated_project)
+        script_fingerprint = compute_script_fingerprint(project.scriptContent)
 
         stages[0] = stages[0].model_copy(update={"status": "running", "progress": 100})
         await publish_video_stages(run.id, stages)
@@ -1410,16 +1581,20 @@ async def run_video_generation_pipeline(
             createdAt=now_iso(),
             runId=run.id,
             settings=settings,
+            parserVersion=SCRIPT_PARSER_VERSION,
+            scriptFingerprint=script_fingerprint,
         )
         store.upsert_entity("videos", project_id, video_record.id, video_record.model_dump())
 
         segments = parse_script(project.scriptContent, project_id)
+        if not segments:
+            raise RuntimeError("No spoken script segments are available. Add narration to the script first.")
 
-        existing_audio_files = collect_generated_audio_files(project_id)
+        current_audios = current_audio_records_by_segment(project, script_fingerprint)
         missing_audio_indices = sorted(
             segment.index
             for segment in segments
-            if segment.cleanText and segment.index not in existing_audio_files
+            if segment.hasNarration and segment.index not in current_audios
         )
         if missing_audio_indices:
             if not request.autoGenerateAudios:
@@ -1454,18 +1629,32 @@ async def run_video_generation_pipeline(
             audio_run_result = get_run(project_id, auto_audio_run.id)
             if audio_run_result.status != "success":
                 raise RuntimeError("Automatic voice generation failed for missing segment(s)")
+            current_audios = current_audio_records_by_segment(project, script_fingerprint)
+
+        missing_audio_indices = sorted(
+            segment.index
+            for segment in segments
+            if segment.hasNarration and segment.index not in current_audios
+        )
+        if missing_audio_indices:
+            raise RuntimeError("Missing fresh generated audios for one or more segments")
 
         stages[1] = stages[1].model_copy(update={"status": "success", "progress": 100})
         await publish_video_stages(run.id, stages)
 
-        existing_image_files = collect_generated_image_files(project_id)
+        current_images = current_image_records_by_segment(project, script_fingerprint)
         missing_image_indices = sorted(
             segment.index
             for segment in segments
-            if segment.imagePrompt and (segment.index + 1) not in existing_image_files
+            if segment.imagePrompt and segment.index not in current_images
         )
 
-        if missing_image_indices and request.autoGenerateImages:
+        if missing_image_indices and not request.autoGenerateImages:
+            raise RuntimeError(
+                "Missing generated images for one or more segments. Enable automatic image generation or generate them first."
+            )
+
+        if missing_image_indices:
             stages[2] = stages[2].model_copy(update={"status": "running", "progress": 30})
             await publish_video_stages(run.id, stages)
 
@@ -1488,14 +1677,21 @@ async def run_video_generation_pipeline(
             image_run_result = get_run(project_id, auto_image_run.id)
             if image_run_result.status != "success":
                 raise RuntimeError("Automatic image generation failed for missing segment(s)")
+            current_images = current_image_records_by_segment(project, script_fingerprint)
+
+        missing_image_indices = sorted(
+            segment.index
+            for segment in segments
+            if segment.imagePrompt and segment.index not in current_images
+        )
+        if missing_image_indices:
+            raise RuntimeError("Missing fresh generated images for one or more segments")
 
         stages[2] = stages[2].model_copy(update={"status": "success", "progress": 100})
         stages[3] = stages[3].model_copy(update={"status": "running", "progress": 20})
         await publish_video_stages(run.id, stages)
 
         script_path = get_script_path(project_id)
-        audio_dir = project_generated_audio_dir(project)
-        images_dir = project_generated_image_dir(project)
         output_path = project_generated_video_dir(project) / settings.outputFilename
         project_generated_video_dir(project).mkdir(parents=True, exist_ok=True)
 
@@ -1506,18 +1702,45 @@ async def run_video_generation_pipeline(
                 {"stream": "stderr" if is_error else "stdout", "line": line},
             )
 
-        await run_python_script(
-            "generate-video.py",
-            project_id=project_id,
-            args=build_video_script_args(
-                settings=settings,
-                script_path=script_path,
-                audio_dir=audio_dir,
-                images_dir=images_dir,
-                output_path=output_path,
-            ),
-            line_callback=on_script_line,
-        )
+        with tempfile.TemporaryDirectory(prefix=f"sealed_nector_render_{project_id}_") as temp_dir:
+            render_root = Path(temp_dir)
+            render_audio_dir = render_root / "audios"
+            render_images_dir = render_root / "images"
+            render_audio_dir.mkdir(parents=True, exist_ok=True)
+            render_images_dir.mkdir(parents=True, exist_ok=True)
+
+            for segment in segments:
+                audio = current_audios.get(segment.index)
+                if audio and audio.audioUrl:
+                    audio_path = local_path_from_asset_url(project_id, audio.audioUrl)
+                    if audio_path is not None and audio_path.exists():
+                        link_or_copy_file(audio_path, render_audio_dir / audio_path.name)
+
+                image = current_images.get(segment.index)
+                prompt_block_index = (
+                    image.promptBlockIndex if image is not None and image.promptBlockIndex is not None
+                    else segment.imagePromptSourceBlockIndex
+                )
+                if image and image.thumbnailUrl and prompt_block_index is not None:
+                    image_path = local_path_from_asset_url(project_id, image.thumbnailUrl)
+                    if image_path is not None and image_path.exists():
+                        link_or_copy_file(
+                            image_path,
+                            render_images_dir / f"image_block_{prompt_block_index + 1}{image_path.suffix or '.png'}",
+                        )
+
+            await run_python_script(
+                "generate-video.py",
+                project_id=project_id,
+                args=build_video_script_args(
+                    settings=settings,
+                    script_path=script_path,
+                    audio_dir=render_audio_dir,
+                    images_dir=render_images_dir,
+                    output_path=output_path,
+                ),
+                line_callback=on_script_line,
+            )
 
         if not output_path.exists():
             raise RuntimeError("Video output file was not generated")
@@ -1541,6 +1764,8 @@ async def run_video_generation_pipeline(
             createdAt=now_iso(),
             runId=run.id,
             settings=settings,
+            parserVersion=SCRIPT_PARSER_VERSION,
+            scriptFingerprint=script_fingerprint,
         )
         store.upsert_entity("videos", project_id, completed_video.id, completed_video.model_dump())
         await publish_run_event(run.id, "video-update", {"video": completed_video.model_dump()})
@@ -1564,6 +1789,8 @@ async def run_video_generation_pipeline(
             createdAt=now_iso(),
             runId=run.id,
             settings=settings,
+            parserVersion=SCRIPT_PARSER_VERSION,
+            scriptFingerprint=compute_script_fingerprint(require_project(project_id).scriptContent),
         )
         store.upsert_entity("videos", project_id, failed_video.id, failed_video.model_dump())
         await publish_run_event(run.id, "video-update", {"video": failed_video.model_dump()})
@@ -1781,7 +2008,7 @@ def set_default_voice(project_id: str, body: dict[str, str]) -> dict[str, Any]:
 @app.get("/api/projects/{project_id}/audios", response_model=list[GeneratedAudio])
 def list_generated_audios(project_id: str) -> list[GeneratedAudio]:
     require_project(project_id)
-    return [item for item in load_valid_entities("audios", project_id, GeneratedAudio) if isinstance(item, GeneratedAudio)]
+    return list_generated_audio_models(project_id)
 
 
 @app.post("/api/projects/{project_id}/generate-audios")
@@ -1821,7 +2048,7 @@ def delete_audio(project_id: str, audio_id: str) -> JSONResponse:
 @app.get("/api/projects/{project_id}/images", response_model=list[GeneratedImage])
 def list_generated_images(project_id: str) -> list[GeneratedImage]:
     require_project(project_id)
-    return [item for item in load_valid_entities("images", project_id, GeneratedImage) if isinstance(item, GeneratedImage)]
+    return list_generated_image_models(project_id)
 
 
 @app.post("/api/projects/{project_id}/generate-images")
@@ -1861,7 +2088,7 @@ def delete_image(project_id: str, image_id: str) -> JSONResponse:
 @app.get("/api/projects/{project_id}/videos", response_model=list[GeneratedVideo])
 def list_generated_videos(project_id: str) -> list[GeneratedVideo]:
     require_project(project_id)
-    return [item for item in load_valid_entities("videos", project_id, GeneratedVideo) if isinstance(item, GeneratedVideo)]
+    return list_generated_video_models(project_id)
 
 
 @app.post("/api/projects/{project_id}/generate-video")

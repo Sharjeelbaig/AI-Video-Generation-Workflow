@@ -99,10 +99,7 @@ BOOLEAN_OPTIONS = {
 STYLE_NORMAL = "normal"
 STYLE_HEADING = "heading"
 STYLE_SUBHEADING = "subheading"
-MARKUP_TAG_RE = re.compile(r"<\s*/?\s*(heading|subheading)\s*>", re.IGNORECASE)
 IMAGE_TAG_RE = re.compile(r"<\s*image\s*>.*?<\s*/\s*image\s*>", re.IGNORECASE | re.DOTALL)
-HEADING_TAG_RE = re.compile(r"<\s*/?\s*heading\s*>", re.IGNORECASE)
-SUBHEADING_TAG_RE = re.compile(r"<\s*/?\s*subheading\s*>", re.IGNORECASE)
 WAV_INDEX_RE = re.compile(r"_(\d+)_\d+\.wav$", re.IGNORECASE)
 IMAGE_BLOCK_FILE_RE = re.compile(r"image_block_(\d+)\.[A-Za-z0-9]+$", re.IGNORECASE)
 IMAGE_SEQUENCE_FILE_RE = re.compile(r"image_(\d+)\.[A-Za-z0-9]+$", re.IGNORECASE)
@@ -111,8 +108,9 @@ IMAGE_SEQUENCE_FILE_RE = re.compile(r"image_(\d+)\.[A-Za-z0-9]+$", re.IGNORECASE
 @dataclass(frozen=True)
 class ScriptSegment:
     text: str
-    style: str = STYLE_NORMAL
-    has_image: bool = False
+    heading: str | None = None
+    subheading: str | None = None
+    image_prompt_block_index: int | None = None
 
 
 @dataclass(frozen=True)
@@ -126,7 +124,7 @@ class SceneChunk:
     runs: list[StyledRun]
     start: float
     end: float
-    raw_segment_index: int | None = None
+    segment_index: int | None = None
 
 
 @dataclass(frozen=True)
@@ -301,30 +299,63 @@ def normalize_text(value: str) -> str:
     return " ".join(value.split())
 
 
-def parse_script_segment(value: str) -> ScriptSegment:
-    has_image = bool(IMAGE_TAG_RE.search(value))
-    text_without_image_markup = IMAGE_TAG_RE.sub(" ", value)
-
-    style = STYLE_NORMAL
-    if HEADING_TAG_RE.search(text_without_image_markup):
-        style = STYLE_HEADING
-    elif SUBHEADING_TAG_RE.search(text_without_image_markup):
-        style = STYLE_SUBHEADING
-
-    cleaned_text = normalize_text(MARKUP_TAG_RE.sub(" ", text_without_image_markup))
-    return ScriptSegment(text=cleaned_text, style=style, has_image=has_image)
+def extract_tag(text: str, tag: str) -> str | None:
+    match = re.search(rf"<{tag}>([\s\S]*?)</{tag}>", text, flags=re.IGNORECASE)
+    if not match:
+        return None
+    return match.group(1).strip() or None
 
 
-def load_script_segments(script_path: Path) -> tuple[list[ScriptSegment], list[ScriptSegment], list[int]]:
-    raw_segments = [parse_script_segment(piece) for piece in script_path.read_text(encoding="utf-8").split("---")]
-    non_empty_segments: list[ScriptSegment] = []
-    non_empty_raw_indices: list[int] = []
-    for index, segment in enumerate(raw_segments):
-        if not segment.text:
+def strip_spoken_text(text: str) -> str:
+    stripped = re.sub(r"<Heading>[\s\S]*?</Heading>", "", text, flags=re.IGNORECASE)
+    stripped = re.sub(r"<SubHeading>[\s\S]*?</SubHeading>", "", stripped, flags=re.IGNORECASE)
+    stripped = re.sub(r"<image>[\s\S]*?</image>", "", stripped, flags=re.IGNORECASE)
+    stripped = re.sub(r"<[^>]+>", "", stripped)
+    return normalize_text(stripped)
+
+
+def load_script_segments(script_path: Path) -> list[ScriptSegment]:
+    raw_blocks = [
+        block
+        for block in (piece.strip() for piece in re.split(r"^---$", script_path.read_text(encoding="utf-8"), flags=re.MULTILINE))
+        if block
+    ]
+
+    segments: list[ScriptSegment] = []
+    pending_heading: str | None = None
+    pending_subheading: str | None = None
+    pending_image_prompt_block_index: int | None = None
+
+    for block_index, raw_block in enumerate(raw_blocks):
+        heading = extract_tag(raw_block, "Heading")
+        subheading = extract_tag(raw_block, "SubHeading")
+        image_prompt = extract_tag(raw_block, "image")
+        spoken_text = strip_spoken_text(raw_block)
+
+        if not spoken_text:
+            if heading:
+                pending_heading = heading
+            if subheading:
+                pending_subheading = subheading
+            if image_prompt:
+                pending_image_prompt_block_index = block_index
             continue
-        non_empty_segments.append(segment)
-        non_empty_raw_indices.append(index)
-    return raw_segments, non_empty_segments, non_empty_raw_indices
+
+        segments.append(
+            ScriptSegment(
+                text=spoken_text,
+                heading=heading or pending_heading,
+                subheading=subheading or pending_subheading,
+                image_prompt_block_index=(
+                    block_index if image_prompt else pending_image_prompt_block_index
+                ),
+            )
+        )
+        pending_heading = None
+        pending_subheading = None
+        pending_image_prompt_block_index = None
+
+    return segments
 
 
 def extract_wav_index(path: Path) -> int | None:
@@ -351,25 +382,21 @@ def format_segment_refs(indices: list[int], segments: list[ScriptSegment], limit
 
 
 def build_segment_count_error(
-    raw_segments: list[ScriptSegment],
-    non_empty_segments: list[ScriptSegment],
+    segments: list[ScriptSegment],
     wav_files: list[Path],
 ) -> str:
-    message = (
-        f"Script segment count ({len(raw_segments)} raw / {len(non_empty_segments)} non-empty) "
-        f"does not match WAV file count ({len(wav_files)})"
-    )
+    message = f"Script spoken segment count ({len(segments)}) does not match WAV file count ({len(wav_files)})"
 
     wav_indices = [extract_wav_index(path) for path in wav_files]
     if any(index is None for index in wav_indices):
         return message
 
     indexed_wav_files = [index for index in wav_indices if index is not None]
-    missing_indices = sorted(set(range(len(raw_segments))) - set(indexed_wav_files))
-    extra_indices = sorted(set(indexed_wav_files) - set(range(len(raw_segments))))
+    missing_indices = sorted(set(range(len(segments))) - set(indexed_wav_files))
+    extra_indices = sorted(set(indexed_wav_files) - set(range(len(segments))))
     details: list[str] = []
     if missing_indices:
-        details.append(f"missing audio indices: {format_segment_refs(missing_indices, raw_segments)}")
+        details.append(f"missing audio indices: {format_segment_refs(missing_indices, segments)}")
     if extra_indices:
         details.append(f"unexpected audio indices: {', '.join(str(index) for index in extra_indices[:5])}")
     if not details:
@@ -378,27 +405,21 @@ def build_segment_count_error(
 
 
 def resolve_script_segments(
-    raw_segments: list[ScriptSegment],
-    non_empty_segments: list[ScriptSegment],
-    non_empty_raw_indices: list[int],
+    segments: list[ScriptSegment],
     wav_files: list[Path],
-) -> tuple[list[ScriptSegment], list[int]]:
+) -> list[ScriptSegment]:
     expected_count = len(wav_files)
     wav_indices = [extract_wav_index(path) for path in wav_files]
 
     if all(index is not None for index in wav_indices):
         indexed_wav_files = [index for index in wav_indices if index is not None]
-        if indexed_wav_files == list(range(expected_count)) and len(raw_segments) >= expected_count:
-            return raw_segments[:expected_count], list(range(expected_count))
-        if indexed_wav_files == non_empty_raw_indices[:expected_count] and len(non_empty_segments) >= expected_count:
-            return non_empty_segments[:expected_count], non_empty_raw_indices[:expected_count]
+        if indexed_wav_files != list(range(expected_count)):
+            fail(build_segment_count_error(segments, wav_files))
 
-    if len(raw_segments) == expected_count:
-        return raw_segments, list(range(expected_count))
-    if len(non_empty_segments) == expected_count:
-        return non_empty_segments, non_empty_raw_indices[:expected_count]
+    if len(segments) < expected_count:
+        fail(build_segment_count_error(segments, wav_files))
 
-    fail(build_segment_count_error(raw_segments, non_empty_segments, wav_files))
+    return segments[:expected_count]
 
 
 def split_scene_text(text: str, words_per_scene: int) -> list[str]:
@@ -420,13 +441,12 @@ def split_scene_text(text: str, words_per_scene: int) -> list[str]:
 def build_segment_bound_scenes(
     segments: list[ScriptSegment],
     wav_files: list[Path],
-    segment_raw_indices: list[int],
     words_per_scene: int,
 ) -> tuple[list[SceneChunk], float]:
     scenes: list[SceneChunk] = []
     current_time = 0.0
 
-    for segment, wav_path, raw_segment_index in zip(segments, wav_files, segment_raw_indices, strict=True):
+    for segment_index, (segment, wav_path) in enumerate(zip(segments, wav_files, strict=True)):
         duration = get_wav_duration(wav_path)
         chunks = split_scene_text(segment.text, words_per_scene)
         chunk_duration = duration / len(chunks)
@@ -436,10 +456,10 @@ def build_segment_bound_scenes(
             end = current_time + chunk_duration
             scenes.append(
                 SceneChunk(
-                    runs=[StyledRun(chunk, segment.style)],
+                    runs=build_segment_runs(segment, chunk),
                     start=start,
                     end=end,
-                    raw_segment_index=raw_segment_index,
+                    segment_index=segment_index,
                 )
             )
             current_time = end
@@ -447,100 +467,47 @@ def build_segment_bound_scenes(
     return scenes, current_time
 
 
-def build_scene_runs(words: list[tuple[str, str]]) -> list[StyledRun]:
-    if not words:
-        return [StyledRun("", STYLE_NORMAL)]
-
+def build_segment_runs(segment: ScriptSegment, body_text: str) -> list[StyledRun]:
     runs: list[StyledRun] = []
-    current_style = words[0][1]
-    current_words: list[str] = []
-
-    for word, style in words:
-        if style != current_style and current_words:
-            runs.append(StyledRun(" ".join(current_words), current_style))
-            current_words = []
-            current_style = style
-        current_words.append(word)
-
-    if current_words:
-        runs.append(StyledRun(" ".join(current_words), current_style))
+    if segment.heading:
+        runs.append(StyledRun(segment.heading, STYLE_HEADING))
+    if segment.subheading:
+        runs.append(StyledRun(segment.subheading, STYLE_SUBHEADING))
+    if body_text:
+        runs.append(StyledRun(body_text, STYLE_NORMAL))
+    if not runs:
+        return [StyledRun("", STYLE_NORMAL)]
     return runs
 
 
 def build_word_bound_scenes(
     segments: list[ScriptSegment],
     wav_files: list[Path],
-    segment_raw_indices: list[int],
     words_per_scene: int,
 ) -> tuple[list[SceneChunk], float]:
-    timed_words: list[tuple[str, str, float, int]] = []
-    leading_gap = 0.0
-
-    for segment, wav_path, raw_segment_index in zip(segments, wav_files, segment_raw_indices, strict=True):
-        duration = get_wav_duration(wav_path)
-        words = segment.text.split()
-        if not words:
-            if timed_words:
-                last_word, last_style, last_duration, last_raw_index = timed_words[-1]
-                timed_words[-1] = (last_word, last_style, last_duration + duration, last_raw_index)
-            else:
-                leading_gap += duration
-            continue
-
-        word_duration = duration / len(words)
-        timed_words.extend((word, segment.style, word_duration, raw_segment_index) for word in words)
-
-    total_duration = leading_gap + sum(duration for _, _, duration, _ in timed_words)
-    if not timed_words:
-        return [SceneChunk(runs=[StyledRun("", STYLE_NORMAL)], start=0.0, end=total_duration)], total_duration
-
     scenes: list[SceneChunk] = []
-    current_time = leading_gap
-    scene_words: list[tuple[str, str]] = []
-    scene_duration = 0.0
-    scene_raw_index: int | None = None
+    current_time = 0.0
 
-    for word, style, duration, raw_segment_index in timed_words:
-        scene_words.append((word, style))
-        if scene_raw_index is None:
-            scene_raw_index = raw_segment_index
-        scene_duration += duration
-        if words_per_scene > 0 and len(scene_words) < words_per_scene:
+    for segment_index, (segment, wav_path) in enumerate(zip(segments, wav_files, strict=True)):
+        duration = get_wav_duration(wav_path)
+        chunks = split_scene_text(segment.text, words_per_scene)
+        if not chunks:
             continue
-
-        start = current_time
-        end = current_time + scene_duration
-        scenes.append(
-            SceneChunk(
-                runs=build_scene_runs(scene_words),
-                start=start,
-                end=end,
-                raw_segment_index=scene_raw_index,
+        chunk_duration = duration / len(chunks)
+        for chunk in chunks:
+            start = current_time
+            end = current_time + chunk_duration
+            scenes.append(
+                SceneChunk(
+                    runs=build_segment_runs(segment, chunk),
+                    start=start,
+                    end=end,
+                    segment_index=segment_index,
+                )
             )
-        )
-        current_time = end
-        scene_words = []
-        scene_duration = 0.0
-        scene_raw_index = None
+            current_time = end
 
-    if scene_words or not scenes:
-        start = current_time
-        end = current_time + scene_duration
-        scenes.append(
-            SceneChunk(
-                runs=build_scene_runs(scene_words),
-                start=start,
-                end=end,
-                raw_segment_index=scene_raw_index,
-            )
-        )
-        current_time = end
-
-    if scenes and current_time < total_duration:
-        last_scene = scenes[-1]
-        scenes[-1] = SceneChunk(runs=last_scene.runs, start=last_scene.start, end=total_duration)
-
-    return scenes, total_duration
+    return scenes, current_time
 
 
 def get_wav_duration(path: Path) -> float:
@@ -715,13 +682,12 @@ def format_scene_text(
     for run in runs:
         run_style = resolve_text_style(run.style, normal_style, heading_style, subheading_style)
         parts.append(format_styled_run(run.text, run_style, arabic_font))
-    return "".join(parts)
+    return r"\N".join(part for part in parts if part)
 
 
 def build_subtitle_content(
     segments: list[ScriptSegment],
     wav_files: list[Path],
-    segment_raw_indices: list[int],
     words_per_scene: int,
     seperate_text_by_seperatorline: bool,
     width: int,
@@ -776,14 +742,12 @@ def build_subtitle_content(
         scenes, total_duration = build_segment_bound_scenes(
             segments,
             wav_files,
-            segment_raw_indices,
             words_per_scene,
         )
     else:
         scenes, total_duration = build_word_bound_scenes(
             segments,
             wav_files,
-            segment_raw_indices,
             words_per_scene,
         )
 
@@ -970,24 +934,20 @@ def build_image_maps(images_dir: Path) -> tuple[dict[int, Path], dict[int, Path]
     return block_map, sequence_map
 
 
-def build_prompt_order_by_raw_index(
-    segments: list[ScriptSegment],
-    segment_raw_indices: list[int],
-) -> dict[int, int]:
-    prompt_order_by_raw_index: dict[int, int] = {}
+def build_prompt_order_by_segment_index(segments: list[ScriptSegment]) -> dict[int, int]:
+    prompt_order_by_segment_index: dict[int, int] = {}
     prompt_order = 0
-    for segment, raw_index in zip(segments, segment_raw_indices, strict=True):
-        if not segment.has_image:
+    for segment_index, segment in enumerate(segments):
+        if segment.image_prompt_block_index is None:
             continue
         prompt_order += 1
-        prompt_order_by_raw_index[raw_index] = prompt_order
-    return prompt_order_by_raw_index
+        prompt_order_by_segment_index[segment_index] = prompt_order
+    return prompt_order_by_segment_index
 
 
 def resolve_scene_backgrounds(
     scenes: list[SceneChunk],
     segments: list[ScriptSegment],
-    segment_raw_indices: list[int],
     images_dir: Path,
 ) -> list[Path | None]:
     if not scenes:
@@ -997,28 +957,24 @@ def resolve_scene_backgrounds(
     if not block_images and not sequence_images:
         return [None for _ in scenes]
 
-    segment_by_raw_index = {
-        raw_index: segment
-        for segment, raw_index in zip(segments, segment_raw_indices, strict=True)
-    }
-    prompt_order_by_raw_index = build_prompt_order_by_raw_index(segments, segment_raw_indices)
+    prompt_order_by_segment_index = build_prompt_order_by_segment_index(segments)
 
     scene_backgrounds: list[Path | None] = []
     for scene in scenes:
-        raw_index = scene.raw_segment_index
-        if raw_index is None:
+        segment_index = scene.segment_index
+        if segment_index is None or segment_index >= len(segments):
             scene_backgrounds.append(None)
             continue
 
-        segment = segment_by_raw_index.get(raw_index)
-        if segment is None or not segment.has_image:
+        segment = segments[segment_index]
+        if segment.image_prompt_block_index is None:
             scene_backgrounds.append(None)
             continue
 
-        block_index = raw_index + 1
+        block_index = segment.image_prompt_block_index + 1
         image_path = block_images.get(block_index)
         if image_path is None:
-            prompt_order = prompt_order_by_raw_index.get(raw_index)
+            prompt_order = prompt_order_by_segment_index.get(segment_index)
             if prompt_order is not None:
                 image_path = sequence_images.get(prompt_order)
 
@@ -1239,18 +1195,11 @@ def main() -> None:
     if limit is not None:
         wav_files = wav_files[:limit]
 
-    raw_segments, non_empty_segments, non_empty_raw_indices = load_script_segments(script_path)
-    segments, segment_raw_indices = resolve_script_segments(
-        raw_segments,
-        non_empty_segments,
-        non_empty_raw_indices,
-        wav_files,
-    )
+    segments = resolve_script_segments(load_script_segments(script_path), wav_files)
 
     subtitle_content, _, scenes = build_subtitle_content(
         segments=segments,
         wav_files=wav_files,
-        segment_raw_indices=segment_raw_indices,
         words_per_scene=words_per_scene,
         seperate_text_by_seperatorline=seperate_text_by_seperatorline,
         width=width,
@@ -1267,7 +1216,6 @@ def main() -> None:
     scene_backgrounds = resolve_scene_backgrounds(
         scenes=scenes,
         segments=segments,
-        segment_raw_indices=segment_raw_indices,
         images_dir=images_dir,
     )
 

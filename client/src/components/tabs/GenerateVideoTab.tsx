@@ -7,6 +7,7 @@ import CardContent from '@mui/material/CardContent';
 import CardMedia from '@mui/material/CardMedia';
 import Stack from '@mui/material/Stack';
 import Button from '@mui/material/Button';
+import Alert from '@mui/material/Alert';
 import TextField from '@mui/material/TextField';
 import FormControl from '@mui/material/FormControl';
 import InputLabel from '@mui/material/InputLabel';
@@ -26,18 +27,32 @@ import DeleteOutlineIcon from '@mui/icons-material/DeleteOutline';
 import MovieOutlinedIcon from '@mui/icons-material/MovieOutlined';
 import CheckCircleOutlineIcon from '@mui/icons-material/CheckCircleOutline';
 import RadioButtonUncheckedIcon from '@mui/icons-material/RadioButtonUnchecked';
-import type { Project, DesignedVoiceAsset, GeneratedVideo, VideoSettings, VideoStage } from '../../types';
+import type {
+  Project,
+  DesignedVoiceAsset,
+  GeneratedAudio,
+  GeneratedImage,
+  GeneratedVideo,
+  VideoSettings,
+  VideoStage,
+} from '../../types';
 import StatusChip from '../common/StatusChip';
 import ConfirmDialog from '../common/ConfirmDialog';
 import { mockApi, generateId } from '../../services/mockApi';
 import { useApp } from '../../store/AppContext';
 import { parseScript } from '../../services/scriptParser';
+import {
+  countStaleOutputs,
+  formatOptionalRoundedSeconds,
+  isStaleOutputRecord,
+  partitionFreshOutputs,
+} from '../../utils/outputStability';
 
 interface Props {
   project: Project;
   designedVoices: DesignedVoiceAsset[];
-  audios: { segmentIndex: number; status: string }[];
-  images: { segmentIndex: number; status: string; thumbnailUrl: string | null }[];
+  audios: GeneratedAudio[];
+  images: GeneratedImage[];
   videos: GeneratedVideo[];
 }
 
@@ -119,10 +134,15 @@ export default function GenerateVideoTab({
   const [deleteTarget, setDeleteTarget] = useState<GeneratedVideo | null>(null);
 
   const segments = parseScript(project.scriptContent, project.id);
-  const imageCount = safeImages.filter(i => i.status === 'success').length;
-  const matchedAudio = segments.filter(s => safeAudios.some(a => a.segmentIndex === s.index && a.status === 'success'));
-  const scenesWithImages = segments.filter(s => safeImages.some(i => i.segmentIndex === s.index && i.status === 'success'));
-  const fallbackScenes = segments.filter(s => !safeImages.some(i => i.segmentIndex === s.index && i.status === 'success'));
+  const { fresh: freshAudios } = partitionFreshOutputs(safeAudios, project.scriptContent);
+  const { fresh: freshImages } = partitionFreshOutputs(safeImages, project.scriptContent);
+  const imageCount = freshImages.filter(image => image.status === 'success').length;
+  const matchedAudio = segments.filter(segment => freshAudios.some(audio => audio.segmentIndex === segment.index && audio.status === 'success'));
+  const scenesWithImages = segments.filter(segment => freshImages.some(image => image.segmentIndex === segment.index && image.status === 'success'));
+  const fallbackScenes = segments.filter(segment => !freshImages.some(image => image.segmentIndex === segment.index && image.status === 'success'));
+  const staleAudioCount = countStaleOutputs(safeAudios, project.scriptContent);
+  const staleImageCount = countStaleOutputs(safeImages, project.scriptContent);
+  const staleVideoCount = countStaleOutputs(safeVideos, project.scriptContent);
 
   const updateSetting = <K extends keyof VideoSettings>(key: K, val: VideoSettings[K]) => {
     setSettings(prev => ({ ...prev, [key]: val }));
@@ -272,6 +292,15 @@ export default function GenerateVideoTab({
           <Card sx={{ mb: 3 }}>
             <CardContent sx={{ p: 3 }}>
               <Typography variant="subtitle1" fontWeight={700} mb={2}>Summary</Typography>
+              {(staleAudioCount > 0 || staleImageCount > 0 || staleVideoCount > 0) && (
+                <Alert severity="warning" sx={{ mb: 2 }}>
+                  {[
+                    staleAudioCount > 0 ? `${staleAudioCount} stale audio` : null,
+                    staleImageCount > 0 ? `${staleImageCount} stale image` : null,
+                    staleVideoCount > 0 ? `${staleVideoCount} stale video` : null,
+                  ].filter(Boolean).join(', ')} asset{staleAudioCount + staleImageCount + staleVideoCount > 1 ? 's are' : ' is'} visible for inspection but will not be reused for a new render.
+                </Alert>
+              )}
               <Stack spacing={1.5}>
                 {[
                   { label: 'Total segments', value: segments.length, color: 'text.primary' },
@@ -338,10 +367,15 @@ export default function GenerateVideoTab({
                         <Box>
                           <Typography variant="body2" fontWeight={700}>{video.filename}</Typography>
                           <Typography variant="caption" color="text.secondary">
-                            {video.duration ? `${Math.round(video.duration)}s` : '—'} · {video.settings.width}×{video.settings.height}
+                            {formatOptionalRoundedSeconds(video.duration)} · {video.settings.width}×{video.settings.height}
                           </Typography>
                         </Box>
-                        <StatusChip status={video.status} />
+                        <Stack direction="row" spacing={0.5} alignItems="center">
+                          {isStaleOutputRecord(video, project.scriptContent) && (
+                            <Chip label="Stale" size="small" color="warning" sx={{ height: 20, fontSize: '0.62rem' }} />
+                          )}
+                          <StatusChip status={video.status} />
+                        </Stack>
                       </Stack>
                       <Stack direction="row" spacing={0.5} mt={1}>
                         <Tooltip title="Preview">

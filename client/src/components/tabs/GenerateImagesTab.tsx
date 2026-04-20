@@ -12,6 +12,7 @@ import Tooltip from '@mui/material/Tooltip';
 import Checkbox from '@mui/material/Checkbox';
 import Alert from '@mui/material/Alert';
 import Grid from '@mui/material/Grid';
+import Chip from '@mui/material/Chip';
 import { alpha } from '@mui/material/styles';
 import DownloadIcon from '@mui/icons-material/Download';
 import DeleteOutlineIcon from '@mui/icons-material/DeleteOutline';
@@ -24,6 +25,11 @@ import ConfirmDialog from '../common/ConfirmDialog';
 import { mockApi, generateId } from '../../services/mockApi';
 import { useApp } from '../../store/AppContext';
 import { parseScript } from '../../services/scriptParser';
+import {
+  getPreferredOutputForSegment,
+  isStaleOutputRecord,
+  partitionFreshOutputs,
+} from '../../utils/outputStability';
 
 interface Props {
   project: Project;
@@ -40,9 +46,11 @@ export default function GenerateImagesTab({ project, images }: Props) {
   const segments = parseScript(project.scriptContent, project.id);
   const segmentsWithPrompts = segments.filter(s => s.imagePrompt);
   const segmentsWithoutPrompts = segments.filter(s => !s.imagePrompt);
+  const { stale: staleImages } = partitionFreshOutputs(images, project.scriptContent);
 
-  const getImageForSegment = useCallback((idx: number) =>
-    images.find(i => i.segmentIndex === idx), [images]);
+  const getImageStateForSegment = useCallback((idx: number) => (
+    getPreferredOutputForSegment(images, idx, project.scriptContent)
+  ), [images, project.scriptContent]);
 
   const toggleSelect = (idx: number) => {
     setSelected(prev => {
@@ -83,7 +91,9 @@ export default function GenerateImagesTab({ project, images }: Props) {
           });
         }
       );
-      const existing = images.find(i => i.segmentIndex === idx);
+      const existing = images.find(image => (
+        image.segmentIndex === idx && !isStaleOutputRecord(image, project.scriptContent)
+      ));
       dispatch({ type: 'UPDATE_IMAGE', projectId: project.id, payload: { ...img, id: existing?.id || img.id } });
     } catch {
       dispatch({
@@ -125,7 +135,10 @@ export default function GenerateImagesTab({ project, images }: Props) {
   };
 
   const handleRetryFailed = async () => {
-    const failed = segmentsWithPrompts.filter(s => getImageForSegment(s.index)?.status === 'failed');
+    const failed = segmentsWithPrompts.filter((segment) => {
+      const { record, stale } = getImageStateForSegment(segment.index);
+      return !stale && record?.status === 'failed';
+    });
     if (failed.length === 0) { toast('No failed images to retry', 'info'); return; }
     const runId = generateId('run');
     const run = mockApi.createRunJob(project.id, 'generate-images', `Retry ${failed.length} images`, failed.map(s => s.id));
@@ -149,7 +162,10 @@ export default function GenerateImagesTab({ project, images }: Props) {
     }
   };
 
-  const failedCount = segmentsWithPrompts.filter(s => getImageForSegment(s.index)?.status === 'failed').length;
+  const failedCount = segmentsWithPrompts.filter((segment) => {
+    const { record, stale } = getImageStateForSegment(segment.index);
+    return !stale && record?.status === 'failed';
+  }).length;
   const anyRunning = running.size > 0;
 
   return (
@@ -184,6 +200,13 @@ export default function GenerateImagesTab({ project, images }: Props) {
         </Alert>
       )}
 
+      {staleImages.length > 0 && (
+        <Alert severity="warning" sx={{ mb: 3 }}>
+          {staleImages.length} generated image{staleImages.length > 1 ? 's are' : ' is'} tied to an older
+          script/parser state and will not be reused until regenerated.
+        </Alert>
+      )}
+
       <Stack direction="row" alignItems="center" spacing={0.5} mb={2}>
         <Checkbox
           size="small"
@@ -199,7 +222,7 @@ export default function GenerateImagesTab({ project, images }: Props) {
 
       <Grid container spacing={2}>
         {segmentsWithPrompts.map(seg => {
-          const img = getImageForSegment(seg.index);
+          const { record: img, stale } = getImageStateForSegment(seg.index);
           const isRunning = running.has(seg.index);
           const prog = progress[seg.index] ?? (img?.progress ?? 0);
           const status = isRunning ? 'running' : (img?.status ?? 'idle');
@@ -238,8 +261,11 @@ export default function GenerateImagesTab({ project, images }: Props) {
                       sx={{ bgcolor: t => alpha(t.palette.background.paper, 0.8), borderRadius: 1, p: 0.25 }}
                     />
                   </Box>
-                  <Box sx={{ position: 'absolute', top: 8, right: 8 }}>
-                    <StatusChip status={status} />
+                    <Box sx={{ position: 'absolute', top: 8, right: 8 }}>
+                    <Stack direction="row" spacing={0.5} alignItems="center">
+                      {stale && !isRunning && <Chip label="Stale" size="small" color="warning" sx={{ height: 20, fontSize: '0.62rem' }} />}
+                      <StatusChip status={status} />
+                    </Stack>
                   </Box>
                 </Box>
                 <CardContent sx={{ p: 1.5, '&:last-child': { pb: 1.5 } }}>

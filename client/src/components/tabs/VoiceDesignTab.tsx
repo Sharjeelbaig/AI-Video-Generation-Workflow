@@ -30,6 +30,7 @@ import EmptyState from '../common/EmptyState';
 import ConfirmDialog from '../common/ConfirmDialog';
 import { mockApi, generateId } from '../../services/mockApi';
 import { useApp } from '../../store/AppContext';
+import { formatOptionalSeconds } from '../../utils/outputStability';
 
 interface Props {
   project: Project;
@@ -266,7 +267,7 @@ export default function VoiceDesignTab({ project, voiceDesigns }: Props) {
                           <Stack direction="row" alignItems="center" spacing={0.5}>
                             <AccessTimeIcon sx={{ fontSize: 12, color: 'text.secondary' }} />
                             <Typography variant="caption" color="text.secondary">
-                              {vd.duration.toFixed(1)}s
+                              {formatOptionalSeconds(vd.duration)}
                             </Typography>
                           </Stack>
                           <Typography variant="caption" color="text.secondary">
