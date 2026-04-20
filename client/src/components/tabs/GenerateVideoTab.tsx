@@ -38,6 +38,7 @@ import type {
 } from '../../types';
 import StatusChip from '../common/StatusChip';
 import ConfirmDialog from '../common/ConfirmDialog';
+import MediaPreviewDialog, { type MediaPreviewTarget } from '../common/MediaPreviewDialog';
 import { mockApi, generateId } from '../../services/mockApi';
 import { useApp } from '../../store/AppContext';
 import { parseScript } from '../../services/scriptParser';
@@ -109,6 +110,7 @@ export default function GenerateVideoTab({
   const [selectedVoiceId, setSelectedVoiceId] = useState('');
   const [running, setRunning] = useState(false);
   const [stages, setStages] = useState<VideoStage[]>([]);
+  const [previewTarget, setPreviewTarget] = useState<MediaPreviewTarget | null>(null);
   const safeDesignedVoices = Array.isArray(designedVoices) ? designedVoices : [];
   const safeAudios = Array.isArray(audios) ? audios : [];
   const safeImages = Array.isArray(images) ? images : [];
@@ -379,7 +381,20 @@ export default function GenerateVideoTab({
                       </Stack>
                       <Stack direction="row" spacing={0.5} mt={1}>
                         <Tooltip title="Preview">
-                          <IconButton size="small" sx={{ color: 'secondary.main' }}><PlayArrowIcon sx={{ fontSize: 16 }} /></IconButton>
+                          <span>
+                            <IconButton
+                              size="small"
+                              sx={{ color: 'secondary.main' }}
+                              onClick={() => video.videoUrl && setPreviewTarget({
+                                title: video.filename,
+                                kind: 'video',
+                                src: video.videoUrl,
+                              })}
+                              disabled={!video.videoUrl}
+                            >
+                              <PlayArrowIcon sx={{ fontSize: 16 }} />
+                            </IconButton>
+                          </span>
                         </Tooltip>
                         <Tooltip title="Download">
                           <IconButton size="small"><DownloadIcon sx={{ fontSize: 16 }} /></IconButton>
@@ -408,6 +423,7 @@ export default function GenerateVideoTab({
         onConfirm={handleDelete}
         onCancel={() => setDeleteTarget(null)}
       />
+      <MediaPreviewDialog media={previewTarget} onClose={() => setPreviewTarget(null)} />
     </Box>
   );
 }

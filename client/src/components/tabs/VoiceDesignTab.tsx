@@ -28,6 +28,7 @@ import type { Project, VoiceDesign, TonePreset, NarrationMood } from '../../type
 import StatusChip from '../common/StatusChip';
 import EmptyState from '../common/EmptyState';
 import ConfirmDialog from '../common/ConfirmDialog';
+import MediaPreviewDialog, { type MediaPreviewTarget } from '../common/MediaPreviewDialog';
 import { mockApi, generateId } from '../../services/mockApi';
 import { useApp } from '../../store/AppContext';
 import { formatOptionalSeconds } from '../../utils/outputStability';
@@ -57,6 +58,7 @@ export default function VoiceDesignTab({ project, voiceDesigns }: Props) {
   const [mood, setMood] = useState<NarrationMood>('documentary');
   const [loading, setLoading] = useState(false);
   const [deleteTarget, setDeleteTarget] = useState<VoiceDesign | null>(null);
+  const [previewTarget, setPreviewTarget] = useState<MediaPreviewTarget | null>(null);
 
   const handleDesign = async () => {
     if (!name.trim() || !prompt.trim()) {
@@ -277,10 +279,21 @@ export default function VoiceDesignTab({ project, voiceDesigns }: Props) {
                         </Stack>
                       </Box>
                       <Stack direction="row" spacing={0.5}>
-                        <Tooltip title="Preview (mock)">
-                          <IconButton size="small" sx={{ color: 'secondary.main' }}>
-                            <PlayArrowIcon fontSize="small" />
-                          </IconButton>
+                        <Tooltip title={vd.audioUrl ? 'Preview' : 'Preview unavailable'}>
+                          <span>
+                            <IconButton
+                              size="small"
+                              sx={{ color: 'secondary.main' }}
+                              onClick={() => vd.audioUrl && setPreviewTarget({
+                                title: vd.name,
+                                kind: 'audio',
+                                src: vd.audioUrl,
+                              })}
+                              disabled={!vd.audioUrl}
+                            >
+                              <PlayArrowIcon fontSize="small" />
+                            </IconButton>
+                          </span>
                         </Tooltip>
                         <Tooltip title={vd.isDefault ? 'Current default' : 'Set as default'}>
                           <IconButton size="small" onClick={() => handleSetDefault(vd)}
@@ -313,6 +326,7 @@ export default function VoiceDesignTab({ project, voiceDesigns }: Props) {
         onConfirm={handleDelete}
         onCancel={() => setDeleteTarget(null)}
       />
+      <MediaPreviewDialog media={previewTarget} onClose={() => setPreviewTarget(null)} />
     </Box>
   );
 }

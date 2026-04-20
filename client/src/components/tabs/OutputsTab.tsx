@@ -32,6 +32,7 @@ import type { Project, VoiceDesign, GeneratedAudio, GeneratedImage, GeneratedVid
 import StatusChip from '../common/StatusChip';
 import EmptyState from '../common/EmptyState';
 import ConfirmDialog from '../common/ConfirmDialog';
+import MediaPreviewDialog, { type MediaPreviewTarget } from '../common/MediaPreviewDialog';
 import { useApp } from '../../store/AppContext';
 import { mockApi } from '../../services/mockApi';
 import {
@@ -69,6 +70,7 @@ export default function OutputsTab({ project, voiceDesigns, audios, images, vide
   const [statusFilter, setStatusFilter] = useState('all');
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [deleteTarget, setDeleteTarget] = useState<{ type: string; id: string; label: string } | null>(null);
+  const [previewTarget, setPreviewTarget] = useState<MediaPreviewTarget | null>(null);
 
   const tabData = [
     { label: 'Voice Designs', icon: RecordVoiceOverOutlinedIcon, count: safeVoiceDesigns.length },
@@ -215,7 +217,21 @@ export default function OutputsTab({ project, voiceDesigns, audios, images, vide
                         </Typography>
                       </Box>
                       <Stack direction="row">
-                        <Tooltip title="Preview"><IconButton size="small"><PlayArrowIcon sx={{ fontSize: 14 }} /></IconButton></Tooltip>
+                        <Tooltip title={vd.audioUrl ? 'Preview' : 'Preview unavailable'}>
+                          <span>
+                            <IconButton
+                              size="small"
+                              onClick={() => vd.audioUrl && setPreviewTarget({
+                                title: vd.name,
+                                kind: 'audio',
+                                src: vd.audioUrl,
+                              })}
+                              disabled={!vd.audioUrl}
+                            >
+                              <PlayArrowIcon sx={{ fontSize: 14 }} />
+                            </IconButton>
+                          </span>
+                        </Tooltip>
                         <Tooltip title="Delete">
                           <IconButton size="small" onClick={() => setDeleteTarget({ type: 'voice', id: vd.id, label: vd.name })} sx={{ color: 'error.main' }}>
                             <DeleteOutlineIcon sx={{ fontSize: 14 }} />
@@ -255,7 +271,21 @@ export default function OutputsTab({ project, voiceDesigns, audios, images, vide
                       <Stack direction="row">
                         {a.status === 'success' && (
                           <>
-                            <Tooltip title="Play"><IconButton size="small"><PlayArrowIcon sx={{ fontSize: 14 }} /></IconButton></Tooltip>
+                            <Tooltip title="Play">
+                              <span>
+                                <IconButton
+                                  size="small"
+                                  onClick={() => a.audioUrl && setPreviewTarget({
+                                    title: `Segment #${a.segmentIndex + 1}`,
+                                    kind: 'audio',
+                                    src: a.audioUrl,
+                                  })}
+                                  disabled={!a.audioUrl}
+                                >
+                                  <PlayArrowIcon sx={{ fontSize: 14 }} />
+                                </IconButton>
+                              </span>
+                            </Tooltip>
                             <Tooltip title="Download"><IconButton size="small"><DownloadIcon sx={{ fontSize: 14 }} /></IconButton></Tooltip>
                           </>
                         )}
@@ -355,7 +385,21 @@ export default function OutputsTab({ project, voiceDesigns, audios, images, vide
                       </Stack>
                       <Stack direction="row" spacing={0.5}>
                         <Checkbox size="small" checked={selected.has(v.id)} onChange={() => toggleSelect(v.id)} />
-                        <Tooltip title="Play"><IconButton size="small"><PlayArrowIcon sx={{ fontSize: 14 }} /></IconButton></Tooltip>
+                        <Tooltip title="Play">
+                          <span>
+                            <IconButton
+                              size="small"
+                              onClick={() => v.videoUrl && setPreviewTarget({
+                                title: v.filename,
+                                kind: 'video',
+                                src: v.videoUrl,
+                              })}
+                              disabled={!v.videoUrl}
+                            >
+                              <PlayArrowIcon sx={{ fontSize: 14 }} />
+                            </IconButton>
+                          </span>
+                        </Tooltip>
                         <Tooltip title="Download"><IconButton size="small"><DownloadIcon sx={{ fontSize: 14 }} /></IconButton></Tooltip>
                         <Tooltip title="Delete">
                           <IconButton size="small" onClick={() => setDeleteTarget({ type: 'video', id: v.id, label: v.filename })} sx={{ color: 'error.main' }}>
@@ -380,6 +424,7 @@ export default function OutputsTab({ project, voiceDesigns, audios, images, vide
         onConfirm={handleDelete}
         onCancel={() => setDeleteTarget(null)}
       />
+      <MediaPreviewDialog media={previewTarget} onClose={() => setPreviewTarget(null)} />
     </Box>
   );
 }

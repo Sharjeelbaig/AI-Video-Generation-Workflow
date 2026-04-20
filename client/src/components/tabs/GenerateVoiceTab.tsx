@@ -24,6 +24,7 @@ import GraphicEqIcon from '@mui/icons-material/GraphicEq';
 import type { Project, DesignedVoiceAsset, GeneratedAudio, ScriptSegment } from '../../types';
 import StatusChip from '../common/StatusChip';
 import ConfirmDialog from '../common/ConfirmDialog';
+import MediaPreviewDialog, { type MediaPreviewTarget } from '../common/MediaPreviewDialog';
 import { mockApi, generateId } from '../../services/mockApi';
 import { useApp } from '../../store/AppContext';
 import { parseScript } from '../../services/scriptParser';
@@ -47,6 +48,7 @@ export default function GenerateVoiceTab({ project, designedVoices = [], audios 
   const [running, setRunning] = useState<Set<number>>(new Set());
   const [progress, setProgress] = useState<Record<number, number>>({});
   const [deleteTarget, setDeleteTarget] = useState<GeneratedAudio | null>(null);
+  const [previewTarget, setPreviewTarget] = useState<MediaPreviewTarget | null>(null);
 
   const safeDesignedVoices = Array.isArray(designedVoices) ? designedVoices : [];
   const safeAudios = Array.isArray(audios) ? audios : [];
@@ -300,7 +302,20 @@ export default function GenerateVoiceTab({ project, designedVoices = [], audios 
                         {audio && status === 'success' && (
                           <>
                             <Tooltip title="Preview">
-                              <IconButton size="small" sx={{ color: 'secondary.main' }}><PlayArrowIcon sx={{ fontSize: 16 }} /></IconButton>
+                              <span>
+                                <IconButton
+                                  size="small"
+                                  sx={{ color: 'secondary.main' }}
+                                  onClick={() => audio.audioUrl && setPreviewTarget({
+                                    title: `Segment #${seg.index + 1}`,
+                                    kind: 'audio',
+                                    src: audio.audioUrl,
+                                  })}
+                                  disabled={!audio.audioUrl}
+                                >
+                                  <PlayArrowIcon sx={{ fontSize: 16 }} />
+                                </IconButton>
+                              </span>
                             </Tooltip>
                             <Tooltip title="Download">
                               <IconButton size="small"><DownloadIcon sx={{ fontSize: 16 }} /></IconButton>
@@ -354,6 +369,7 @@ export default function GenerateVoiceTab({ project, designedVoices = [], audios 
         onConfirm={handleDelete}
         onCancel={() => setDeleteTarget(null)}
       />
+      <MediaPreviewDialog media={previewTarget} onClose={() => setPreviewTarget(null)} />
     </Box>
   );
 }
