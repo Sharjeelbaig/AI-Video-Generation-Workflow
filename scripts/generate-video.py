@@ -103,6 +103,11 @@ IMAGE_TAG_RE = re.compile(r"<\s*image\s*>.*?<\s*/\s*image\s*>", re.IGNORECASE | 
 WAV_INDEX_RE = re.compile(r"_(\d+)_\d+\.wav$", re.IGNORECASE)
 IMAGE_BLOCK_FILE_RE = re.compile(r"image_block_(\d+)\.[A-Za-z0-9]+$", re.IGNORECASE)
 IMAGE_SEQUENCE_FILE_RE = re.compile(r"image_(\d+)\.[A-Za-z0-9]+$", re.IGNORECASE)
+HARD_BOUNDARY_PUNCTUATION = ".!?؟"
+SOFT_BOUNDARY_PUNCTUATION = ",،;؛:"
+BOUNDARY_PUNCTUATION = HARD_BOUNDARY_PUNCTUATION + SOFT_BOUNDARY_PUNCTUATION
+BOUNDARY_TYPE_HARD = "hard"
+BOUNDARY_TYPE_SOFT = "soft"
 
 
 @dataclass(frozen=True)
@@ -125,6 +130,20 @@ class SceneChunk:
     start: float
     end: float
     segment_index: int | None = None
+
+
+@dataclass(frozen=True)
+class PhraseUnit:
+    text: str
+    word_count: int
+    boundary_type: str | None = None
+
+
+@dataclass(frozen=True)
+class SubtitleChunkSpec:
+    text: str
+    word_count: int
+    boundary_type: str | None = None
 
 
 @dataclass(frozen=True)
@@ -438,7 +457,187 @@ def split_scene_text(text: str, words_per_scene: int) -> list[str]:
     ]
 
 
-def build_segment_bound_scenes(
+def count_words(text: str) -> int:
+    return len(text.split())
+
+
+def boundary_type_for_char(char: str) -> str | None:
+    if char in HARD_BOUNDARY_PUNCTUATION:
+        return BOUNDARY_TYPE_HARD
+    if char in SOFT_BOUNDARY_PUNCTUATION:
+        return BOUNDARY_TYPE_SOFT
+    return None
+
+
+def resolve_reasonable_chunk_words(words_per_scene: int) -> int:
+    if words_per_scene <= 0:
+        return 4
+    return max(1, min(words_per_scene, max(3, words_per_scene // 2)))
+
+
+def split_text_into_phrase_units(text: str) -> list[PhraseUnit]:
+    normalized_text = normalize_text(text)
+    if not normalized_text:
+        return []
+
+    phrases: list[PhraseUnit] = []
+    start_index = 0
+    index = 0
+
+    while index < len(normalized_text):
+        if normalized_text[index] not in BOUNDARY_PUNCTUATION:
+            index += 1
+            continue
+
+        boundary_type = boundary_type_for_char(normalized_text[index])
+        boundary_end = index + 1
+        while boundary_end < len(normalized_text) and normalized_text[boundary_end] in BOUNDARY_PUNCTUATION:
+            next_boundary_type = boundary_type_for_char(normalized_text[boundary_end])
+            if next_boundary_type == BOUNDARY_TYPE_HARD:
+                boundary_type = BOUNDARY_TYPE_HARD
+            elif boundary_type is None:
+                boundary_type = next_boundary_type
+            boundary_end += 1
+
+        phrase_text = normalize_text(normalized_text[start_index:boundary_end])
+        if phrase_text:
+            phrases.append(
+                PhraseUnit(
+                    text=phrase_text,
+                    word_count=count_words(phrase_text),
+                    boundary_type=boundary_type,
+                )
+            )
+
+        index = boundary_end
+        while index < len(normalized_text) and normalized_text[index].isspace():
+            index += 1
+        start_index = index
+
+    trailing_text = normalize_text(normalized_text[start_index:])
+    if trailing_text:
+        phrases.append(
+            PhraseUnit(
+                text=trailing_text,
+                word_count=count_words(trailing_text),
+                boundary_type=None,
+            )
+        )
+
+    return phrases
+
+
+def build_word_fallback_chunks(text: str, words_per_scene: int) -> list[SubtitleChunkSpec]:
+    return [
+        SubtitleChunkSpec(
+            text=chunk_text,
+            word_count=count_words(chunk_text),
+            boundary_type=None,
+        )
+        for chunk_text in split_scene_text(text, words_per_scene)
+        if chunk_text
+    ]
+
+
+def build_phrase_chunks(text: str, words_per_scene: int) -> list[SubtitleChunkSpec]:
+    phrases = split_text_into_phrase_units(text)
+    if not phrases or not any(phrase.boundary_type for phrase in phrases):
+        return build_word_fallback_chunks(text, words_per_scene)
+
+    target_words = words_per_scene if words_per_scene > 0 else None
+    minimum_chunk_words = resolve_reasonable_chunk_words(words_per_scene)
+    chunks: list[SubtitleChunkSpec] = []
+    current_phrases: list[str] = []
+    current_word_count = 0
+    current_boundary_type: str | None = None
+
+    def flush_current_chunk() -> None:
+        nonlocal current_phrases, current_word_count, current_boundary_type
+        if not current_phrases:
+            return
+        chunks.append(
+            SubtitleChunkSpec(
+                text=" ".join(current_phrases),
+                word_count=current_word_count,
+                boundary_type=current_boundary_type,
+            )
+        )
+        current_phrases = []
+        current_word_count = 0
+        current_boundary_type = None
+
+    for phrase in phrases:
+        if not current_phrases:
+            current_phrases = [phrase.text]
+            current_word_count = phrase.word_count
+            current_boundary_type = phrase.boundary_type
+            continue
+
+        if current_boundary_type == BOUNDARY_TYPE_HARD:
+            flush_current_chunk()
+            current_phrases = [phrase.text]
+            current_word_count = phrase.word_count
+            current_boundary_type = phrase.boundary_type
+            continue
+
+        next_word_count = current_word_count + phrase.word_count
+        within_target = target_words is None or next_word_count <= target_words
+        needs_more_words = current_word_count < minimum_chunk_words
+
+        if within_target or needs_more_words:
+            current_phrases.append(phrase.text)
+            current_word_count = next_word_count
+            current_boundary_type = phrase.boundary_type
+            continue
+
+        flush_current_chunk()
+        current_phrases = [phrase.text]
+        current_word_count = phrase.word_count
+        current_boundary_type = phrase.boundary_type
+
+    flush_current_chunk()
+    return chunks
+
+
+def chunk_score(chunk: SubtitleChunkSpec) -> float:
+    score = float(max(1, chunk.word_count))
+    if chunk.boundary_type == BOUNDARY_TYPE_HARD:
+        score += 0.7
+    elif chunk.boundary_type == BOUNDARY_TYPE_SOFT:
+        score += 0.35
+    return score
+
+
+def allocate_chunk_durations(chunks: list[SubtitleChunkSpec], total_duration: float) -> list[float]:
+    if not chunks:
+        return []
+    if total_duration <= 0:
+        return [0.0 for _ in chunks]
+
+    scores = [chunk_score(chunk) for chunk in chunks]
+    total_score = sum(scores)
+    if total_score <= 0:
+        return [total_duration / len(chunks) for _ in chunks]
+
+    durations: list[float] = []
+    remaining_duration = total_duration
+    remaining_score = total_score
+
+    for index, score in enumerate(scores):
+        if index == len(scores) - 1 or remaining_score <= 0:
+            duration = remaining_duration
+        else:
+            duration = remaining_duration * (score / remaining_score)
+        durations.append(max(0.0, duration))
+        remaining_duration = max(0.0, remaining_duration - duration)
+        remaining_score -= score
+
+    if durations:
+        durations[-1] += remaining_duration
+    return durations
+
+
+def build_phrase_timed_scenes(
     segments: list[ScriptSegment],
     wav_files: list[Path],
     words_per_scene: int,
@@ -448,15 +647,24 @@ def build_segment_bound_scenes(
 
     for segment_index, (segment, wav_path) in enumerate(zip(segments, wav_files, strict=True)):
         duration = get_wav_duration(wav_path)
-        chunks = split_scene_text(segment.text, words_per_scene)
-        chunk_duration = duration / len(chunks)
+        chunks = build_phrase_chunks(segment.text, words_per_scene)
+        if not chunks:
+            current_time += duration
+            continue
 
-        for chunk in chunks:
+        chunk_durations = allocate_chunk_durations(chunks, duration)
+        segment_end = current_time + duration
+
+        for chunk_index, (chunk, chunk_duration) in enumerate(zip(chunks, chunk_durations, strict=True)):
             start = current_time
-            end = current_time + chunk_duration
+            end = segment_end if chunk_index == len(chunks) - 1 else current_time + chunk_duration
             scenes.append(
                 SceneChunk(
-                    runs=build_segment_runs(segment, chunk),
+                    runs=build_segment_runs(
+                        segment,
+                        chunk.text,
+                        include_titles=chunk_index == 0,
+                    ),
                     start=start,
                     end=end,
                     segment_index=segment_index,
@@ -467,47 +675,21 @@ def build_segment_bound_scenes(
     return scenes, current_time
 
 
-def build_segment_runs(segment: ScriptSegment, body_text: str) -> list[StyledRun]:
+def build_segment_runs(
+    segment: ScriptSegment,
+    body_text: str,
+    include_titles: bool = True,
+) -> list[StyledRun]:
     runs: list[StyledRun] = []
-    if segment.heading:
+    if include_titles and segment.heading:
         runs.append(StyledRun(segment.heading, STYLE_HEADING))
-    if segment.subheading:
+    if include_titles and segment.subheading:
         runs.append(StyledRun(segment.subheading, STYLE_SUBHEADING))
     if body_text:
         runs.append(StyledRun(body_text, STYLE_NORMAL))
     if not runs:
         return [StyledRun("", STYLE_NORMAL)]
     return runs
-
-
-def build_word_bound_scenes(
-    segments: list[ScriptSegment],
-    wav_files: list[Path],
-    words_per_scene: int,
-) -> tuple[list[SceneChunk], float]:
-    scenes: list[SceneChunk] = []
-    current_time = 0.0
-
-    for segment_index, (segment, wav_path) in enumerate(zip(segments, wav_files, strict=True)):
-        duration = get_wav_duration(wav_path)
-        chunks = split_scene_text(segment.text, words_per_scene)
-        if not chunks:
-            continue
-        chunk_duration = duration / len(chunks)
-        for chunk in chunks:
-            start = current_time
-            end = current_time + chunk_duration
-            scenes.append(
-                SceneChunk(
-                    runs=build_segment_runs(segment, chunk),
-                    start=start,
-                    end=end,
-                    segment_index=segment_index,
-                )
-            )
-            current_time = end
-
-    return scenes, current_time
 
 
 def get_wav_duration(path: Path) -> float:
@@ -701,6 +883,9 @@ def build_subtitle_content(
     heading_font_color: str,
     subheading_font_color: str,
 ) -> tuple[str, float, list[SceneChunk]]:
+    # Kept for compatibility with existing callers; subtitle timing is now
+    # phrase-based regardless of the separator-line presentation setting.
+    _ = seperate_text_by_seperatorline
     primary_color = to_ass_color(font_color)
     outline_color = to_ass_color("black")
     margin_v = max(40, height // 12)
@@ -738,18 +923,11 @@ def build_subtitle_content(
         "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text",
     ]
 
-    if seperate_text_by_seperatorline:
-        scenes, total_duration = build_segment_bound_scenes(
-            segments,
-            wav_files,
-            words_per_scene,
-        )
-    else:
-        scenes, total_duration = build_word_bound_scenes(
-            segments,
-            wav_files,
-            words_per_scene,
-        )
+    scenes, total_duration = build_phrase_timed_scenes(
+        segments,
+        wav_files,
+        words_per_scene,
+    )
 
     for scene in scenes:
         escaped_text = format_scene_text(
