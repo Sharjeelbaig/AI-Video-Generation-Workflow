@@ -1,4 +1,4 @@
-import { useState, useMemo } from 'react';
+import { useDeferredValue, useMemo, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import Box from '@mui/material/Box';
 import Container from '@mui/material/Container';
@@ -17,11 +17,13 @@ import DialogTitle from '@mui/material/DialogTitle';
 import DialogContent from '@mui/material/DialogContent';
 import DialogActions from '@mui/material/DialogActions';
 import Skeleton from '@mui/material/Skeleton';
+import Alert from '@mui/material/Alert';
 import { alpha } from '@mui/material/styles';
 import AddIcon from '@mui/icons-material/Add';
 import SearchIcon from '@mui/icons-material/Search';
 import FolderOpenIcon from '@mui/icons-material/FolderOpen';
 import MovieOutlinedIcon from '@mui/icons-material/MovieOutlined';
+import SettingsOutlinedIcon from '@mui/icons-material/SettingsOutlined';
 import CreateProjectModal from '../components/projects/CreateProjectModal';
 import ProjectCard from '../components/projects/ProjectCard';
 import EmptyState from '../components/common/EmptyState';
@@ -29,28 +31,34 @@ import ConfirmDialog from '../components/common/ConfirmDialog';
 import { useApp } from '../store/AppContext';
 import { mockApi } from '../services/mockApi';
 import type { Project, AspectRatio, Language } from '../types';
+import { validateProjectsDirectory } from '../services/validation';
 
 type SortOption = 'updatedAt' | 'createdAt' | 'name';
 type FilterOption = 'all' | 'idle' | 'running' | 'success' | 'failed';
 
 export default function ProjectsPage() {
-  const { state, dispatch, toast } = useApp();
+  const { state, dispatch, toast, reloadAppData } = useApp();
   const navigate = useNavigate();
 
   const [createOpen, setCreateOpen] = useState(false);
   const [search, setSearch] = useState('');
+  const deferredSearch = useDeferredValue(search);
   const [sort, setSort] = useState<SortOption>('updatedAt');
   const [filter, setFilter] = useState<FilterOption>('all');
   const [renameOpen, setRenameOpen] = useState(false);
   const [renameName, setRenameName] = useState('');
   const [renameTarget, setRenameTarget] = useState<Project | null>(null);
   const [deleteTarget, setDeleteTarget] = useState<Project | null>(null);
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const [projectsDirectory, setProjectsDirectory] = useState(state.settings?.projectsDirectory || '');
+  const [settingsError, setSettingsError] = useState('');
+  const [settingsLoading, setSettingsLoading] = useState(false);
 
   const activeProjects = useMemo(() => {
     let list = state.projects.filter(p => !p.archived);
-    if (search) list = list.filter(p =>
-      p.name.toLowerCase().includes(search.toLowerCase()) ||
-      p.description.toLowerCase().includes(search.toLowerCase())
+    if (deferredSearch) list = list.filter(p =>
+      p.name.toLowerCase().includes(deferredSearch.toLowerCase()) ||
+      p.description.toLowerCase().includes(deferredSearch.toLowerCase())
     );
     if (filter !== 'all') list = list.filter(p => p.status === filter);
     list = [...list].sort((a, b) => {
@@ -58,7 +66,7 @@ export default function ProjectsPage() {
       return new Date(b[sort]).getTime() - new Date(a[sort]).getTime();
     });
     return list;
-  }, [state.projects, search, sort, filter]);
+  }, [state.projects, deferredSearch, sort, filter]);
 
   const handleCreate = async (data: { name: string; description: string; language: Language; aspectRatio: AspectRatio }) => {
     try {
@@ -121,6 +129,28 @@ export default function ProjectsPage() {
     }
   };
 
+  const handleSettingsSubmit = async () => {
+    const validation = validateProjectsDirectory(projectsDirectory);
+    if (!validation.success) {
+      setSettingsError(validation.message);
+      return;
+    }
+
+    setSettingsLoading(true);
+    try {
+      const settings = await mockApi.updateSettings(validation.data);
+      dispatch({ type: 'SET_SETTINGS', payload: settings });
+      await reloadAppData();
+      toast('Projects directory updated', 'success');
+      setSettingsOpen(false);
+      setSettingsError('');
+    } catch (error) {
+      setSettingsError((error as Error).message);
+    } finally {
+      setSettingsLoading(false);
+    }
+  };
+
   if (!state.initialized) {
     return (
       <Box sx={{ minHeight: '100vh', bgcolor: 'background.default', pt: 8 }}>
@@ -162,7 +192,7 @@ export default function ProjectsPage() {
         }}
       >
         <Container maxWidth="xl">
-          <Stack direction="row" justifyContent="space-between" alignItems="center" py={2}>
+            <Stack direction="row" justifyContent="space-between" alignItems="center" py={2}>
             <Stack direction="row" alignItems="center" spacing={2}>
               <Box
                 sx={{
@@ -176,21 +206,49 @@ export default function ProjectsPage() {
                 <MovieOutlinedIcon sx={{ fontSize: 18, color: '#0F0F0F' }} />
               </Box>
               <Typography variant="h6" fontWeight={800} letterSpacing="-0.03em">
-                Media<Box component="span" sx={{ color: 'primary.main' }}>Studio</Box>
+                Sealed<Box component="span" sx={{ color: 'primary.main' }}>Nector</Box>
               </Typography>
             </Stack>
-            <Button
-              variant="contained"
-              startIcon={<AddIcon />}
-              onClick={() => setCreateOpen(true)}
-            >
-              New Project
-            </Button>
+            <Stack direction="row" spacing={1}>
+              <Button
+                variant="outlined"
+                color="inherit"
+                startIcon={<SettingsOutlinedIcon />}
+                onClick={() => {
+                  setProjectsDirectory(state.settings?.projectsDirectory || '');
+                  setSettingsError('');
+                  setSettingsOpen(true);
+                }}
+              >
+                Settings
+              </Button>
+              <Button
+                variant="contained"
+                startIcon={<AddIcon />}
+                onClick={() => setCreateOpen(true)}
+              >
+                New Project
+              </Button>
+            </Stack>
           </Stack>
         </Container>
       </Box>
 
       <Container maxWidth="xl" sx={{ py: 5, position: 'relative', zIndex: 1 }}>
+        {state.initializationError && (
+          <Alert
+            severity="error"
+            sx={{ mb: 3 }}
+            action={(
+              <Button color="inherit" size="small" onClick={() => void reloadAppData()}>
+                Retry
+              </Button>
+            )}
+          >
+            {state.initializationError}
+          </Alert>
+        )}
+
         <Box mb={5}>
           <Typography
             variant="h3"
@@ -198,7 +256,7 @@ export default function ProjectsPage() {
             letterSpacing="-0.03em"
             sx={{ mb: 1 }}
           >
-            Your Projects
+            Production Workspace
           </Typography>
           <Typography color="text.secondary">
             {state.projects.filter(p => !p.archived).length} active{' '}
@@ -293,6 +351,37 @@ export default function ProjectsPage() {
       </Container>
 
       <CreateProjectModal open={createOpen} onClose={() => setCreateOpen(false)} onSubmit={handleCreate} />
+
+      <Dialog open={settingsOpen} onClose={() => setSettingsOpen(false)} maxWidth="sm" fullWidth>
+        <DialogTitle>Workspace Settings</DialogTitle>
+        <DialogContent>
+          <Stack spacing={2} sx={{ pt: 1 }}>
+            <Alert severity="info">
+              Assets and project workspaces are resolved from this directory. This keeps storage portable for a future desktop wrapper.
+            </Alert>
+            <TextField
+              label="Projects Directory"
+              fullWidth
+              value={projectsDirectory}
+              onChange={(event) => {
+                setProjectsDirectory(event.target.value);
+                setSettingsError('');
+              }}
+              error={!!settingsError}
+              helperText={settingsError || state.settings?.configPath}
+              placeholder="/Users/you/Documents/SealedNector"
+            />
+          </Stack>
+        </DialogContent>
+        <DialogActions sx={{ px: 3, pb: 3 }}>
+          <Button onClick={() => setSettingsOpen(false)} color="inherit">
+            Cancel
+          </Button>
+          <Button onClick={handleSettingsSubmit} variant="contained" disabled={settingsLoading}>
+            {settingsLoading ? 'Saving…' : 'Save Settings'}
+          </Button>
+        </DialogActions>
+      </Dialog>
 
       <Dialog open={renameOpen} onClose={() => setRenameOpen(false)} maxWidth="xs" fullWidth>
         <DialogTitle sx={{ fontWeight: 700 }}>Rename Project</DialogTitle>

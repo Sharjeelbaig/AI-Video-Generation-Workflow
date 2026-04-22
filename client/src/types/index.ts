@@ -160,3 +160,25 @@ export interface Toast {
   message: string;
   severity: 'success' | 'error' | 'warning' | 'info';
 }
+
+export interface AppSettings {
+  projectsDirectory: string;
+  configPath: string;
+  appDataDirectory: string;
+  logsDirectory: string;
+  stateDirectory: string;
+}
+
+export type RunEvent =
+  | { type: 'run-snapshot'; run: RunJob }
+  | { type: 'run-update'; run: RunJob }
+  | { type: 'run-completed'; run: RunJob }
+  | { type: 'run-failed'; run: RunJob }
+  | { type: 'run-error'; message: string }
+  | { type: 'voice-design-update'; voiceDesign: VoiceDesign }
+  | { type: 'audio-update'; audio: GeneratedAudio }
+  | { type: 'image-update'; image: GeneratedImage }
+  | { type: 'image-progress'; segmentIndex: number; status: JobStatus; progress: number }
+  | { type: 'video-update'; video: GeneratedVideo }
+  | { type: 'video-stages'; stages: VideoStage[] }
+  | { type: 'log'; stream: 'stdout' | 'stderr'; line: string };

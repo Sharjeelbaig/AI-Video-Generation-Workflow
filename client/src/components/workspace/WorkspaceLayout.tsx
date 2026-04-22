@@ -54,6 +54,29 @@ export default function WorkspaceLayout({ project, activeTab, onTabChange, child
     <Box sx={{ height: '100%', display: 'flex', flexDirection: 'column', py: 1 }}>
       <Box sx={{ px: 2, py: 1.5, mb: 1 }}>
         <Stack direction="row" alignItems="center" spacing={1} mb={2}>
+          <Box
+            sx={{
+              width: 30,
+              height: 30,
+              borderRadius: 2,
+              display: 'grid',
+              placeItems: 'center',
+              bgcolor: t => alpha(t.palette.primary.main, 0.14),
+              border: t => `1px solid ${alpha(t.palette.primary.main, 0.24)}`,
+            }}
+          >
+            <MovieOutlinedIcon sx={{ fontSize: 16, color: 'primary.main' }} />
+          </Box>
+          <Box>
+            <Typography variant="caption" color="text.secondary" fontWeight={700} letterSpacing="0.08em">
+              SEALED NECTOR
+            </Typography>
+            <Typography variant="caption" color="text.disabled" display="block">
+              Production Suite
+            </Typography>
+          </Box>
+        </Stack>
+        <Stack direction="row" alignItems="center" spacing={1} mb={2}>
           <Tooltip title="Back to projects">
             <IconButton size="small" onClick={() => navigate('/')} sx={{ color: 'text.secondary' }}>
               <ArrowBackIcon fontSize="small" />

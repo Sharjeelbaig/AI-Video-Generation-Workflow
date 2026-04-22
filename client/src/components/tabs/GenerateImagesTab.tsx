@@ -1,4 +1,4 @@
-import { useState, useCallback } from 'react';
+import { useCallback, useState } from 'react';
 import Box from '@mui/material/Box';
 import Typography from '@mui/material/Typography';
 import Card from '@mui/material/Card';
@@ -19,15 +19,15 @@ import DeleteOutlineIcon from '@mui/icons-material/DeleteOutline';
 import RefreshIcon from '@mui/icons-material/Refresh';
 import ImageOutlinedIcon from '@mui/icons-material/ImageOutlined';
 import ImageNotSupportedIcon from '@mui/icons-material/ImageNotSupported';
-import type { Project, GeneratedImage, ScriptSegment } from '../../types';
+import type { GeneratedImage, Project } from '../../types';
 import StatusChip from '../common/StatusChip';
 import ConfirmDialog from '../common/ConfirmDialog';
-import { mockApi, generateId } from '../../services/mockApi';
+import { mockApi } from '../../services/mockApi';
 import { useApp } from '../../store/AppContext';
 import { parseScript } from '../../services/scriptParser';
+import { exportAsset, filenameFromAssetUrl } from '../../services/fileExport';
 import {
   getPreferredOutputForSegment,
-  isStaleOutputRecord,
   partitionFreshOutputs,
 } from '../../utils/outputStability';
 
@@ -37,121 +37,89 @@ interface Props {
 }
 
 export default function GenerateImagesTab({ project, images }: Props) {
-  const { dispatch, toast } = useApp();
+  const { dispatch, toast, trackRun } = useApp();
   const [selected, setSelected] = useState<Set<number>>(new Set());
-  const [running, setRunning] = useState<Set<number>>(new Set());
-  const [progress, setProgress] = useState<Record<number, number>>({});
   const [deleteTarget, setDeleteTarget] = useState<GeneratedImage | null>(null);
+  const [submitting, setSubmitting] = useState(false);
 
   const segments = parseScript(project.scriptContent, project.id);
-  const segmentsWithPrompts = segments.filter(s => s.imagePrompt);
-  const segmentsWithoutPrompts = segments.filter(s => !s.imagePrompt);
+  const segmentsWithPrompts = segments.filter((segment) => segment.imagePrompt);
+  const segmentsWithoutPrompts = segments.filter((segment) => !segment.imagePrompt);
   const { stale: staleImages } = partitionFreshOutputs(images, project.scriptContent);
+  const anyRunning = images.some((image) => image.status === 'running');
 
-  const getImageStateForSegment = useCallback((idx: number) => (
-    getPreferredOutputForSegment(images, idx, project.scriptContent)
+  const getImageStateForSegment = useCallback((segmentIndex: number) => (
+    getPreferredOutputForSegment(images, segmentIndex, project.scriptContent)
   ), [images, project.scriptContent]);
 
-  const toggleSelect = (idx: number) => {
-    setSelected(prev => {
-      const next = new Set(prev);
-      if (next.has(idx)) next.delete(idx); else next.add(idx);
+  const toggleSelect = (segmentIndex: number) => {
+    setSelected((previous) => {
+      const next = new Set(previous);
+      if (next.has(segmentIndex)) {
+        next.delete(segmentIndex);
+      } else {
+        next.add(segmentIndex);
+      }
       return next;
     });
   };
 
-  const generateSegment = async (seg: ScriptSegment, runId: string) => {
-    if (!seg.imagePrompt) return;
-    const idx = seg.index;
-    setRunning(prev => new Set(prev).add(idx));
-    setProgress(prev => ({ ...prev, [idx]: 0 }));
+  const startGeneration = async (
+    segmentIndices: number[],
+    label: string,
+    successMessage: string,
+  ) => {
+    if (segmentIndices.length === 0) {
+      toast('Select at least one prompt-backed segment', 'warning');
+      return;
+    }
 
-    const tempId = generateId('img');
-    dispatch({
-      type: 'UPDATE_IMAGE',
-      projectId: project.id,
-      payload: {
-        id: tempId, projectId: project.id, segmentId: seg.id, segmentIndex: idx,
-        prompt: seg.imagePrompt!, status: 'running', progress: 0,
-        thumbnailUrl: null, width: 1920, height: 1080,
-        createdAt: new Date().toISOString(), runId,
-      },
-    });
-
+    setSubmitting(true);
     try {
-      const img = await mockApi.generateImage(
-        project.id, seg.id, idx, seg.imagePrompt!, runId,
-        p => {
-          setProgress(prev => ({ ...prev, [idx]: p }));
-          dispatch({
-            type: 'UPDATE_IMAGE', projectId: project.id,
-            payload: { id: tempId, projectId: project.id, segmentId: seg.id, segmentIndex: idx,
-              prompt: seg.imagePrompt!, status: 'running', progress: p,
-              thumbnailUrl: null, width: 1920, height: 1080, createdAt: new Date().toISOString(), runId },
-          });
-        }
-      );
-      const existing = images.find(image => (
-        image.segmentIndex === idx && !isStaleOutputRecord(image, project.scriptContent)
-      ));
-      dispatch({ type: 'UPDATE_IMAGE', projectId: project.id, payload: { ...img, id: existing?.id || img.id } });
-    } catch {
-      dispatch({
-        type: 'UPDATE_IMAGE', projectId: project.id,
-        payload: { id: tempId, projectId: project.id, segmentId: seg.id, segmentIndex: idx,
-          prompt: seg.imagePrompt!, status: 'failed', progress: 0,
-          thumbnailUrl: null, width: 1920, height: 1080, createdAt: new Date().toISOString(), runId },
+      const response = await mockApi.requestImageGeneration(project.id, {
+        segmentIndices,
+        width: project.videoSettings.width,
+        height: project.videoSettings.height,
       });
+      trackRun(project.id, {
+        ...response.run,
+        label,
+      }, {
+        successMessage,
+        failureMessage: `${label} failed`,
+      });
+      setSelected(new Set());
+    } catch (error) {
+      toast((error as Error).message, 'error');
     } finally {
-      setRunning(prev => { const n = new Set(prev); n.delete(idx); return n; });
-      setProgress(prev => { const n = { ...prev }; delete n[idx]; return n; });
+      setSubmitting(false);
     }
-  };
-
-  const handleGenerateAll = async () => {
-    const runId = generateId('run');
-    const run = mockApi.createRunJob(project.id, 'generate-images', `Generate all ${segmentsWithPrompts.length} images`, segmentsWithPrompts.map(s => s.id));
-    dispatch({ type: 'ADD_RUN', projectId: project.id, payload: run });
-    toast(`Generating ${segmentsWithPrompts.length} images`, 'info');
-    for (const segment of segmentsWithPrompts) {
-      await generateSegment(segment, runId);
-    }
-    dispatch({ type: 'UPDATE_RUN', projectId: project.id, payload: { ...run, status: 'success', completedAt: new Date().toISOString() } });
-    toast('Image generation complete', 'success');
-  };
-
-  const handleGenerateSelected = async () => {
-    if (selected.size === 0) { toast('Select segments first', 'warning'); return; }
-    const segs = segmentsWithPrompts.filter(s => selected.has(s.index));
-    const runId = generateId('run');
-    const run = mockApi.createRunJob(project.id, 'generate-images', `Generate ${segs.length} images`, segs.map(s => s.id));
-    dispatch({ type: 'ADD_RUN', projectId: project.id, payload: run });
-    for (const segment of segs) {
-      await generateSegment(segment, runId);
-    }
-    dispatch({ type: 'UPDATE_RUN', projectId: project.id, payload: { ...run, status: 'success', completedAt: new Date().toISOString() } });
-    toast(`Generated ${segs.length} images`, 'success');
-    setSelected(new Set());
   };
 
   const handleRetryFailed = async () => {
-    const failed = segmentsWithPrompts.filter((segment) => {
-      const { record, stale } = getImageStateForSegment(segment.index);
-      return !stale && record?.status === 'failed';
-    });
-    if (failed.length === 0) { toast('No failed images to retry', 'info'); return; }
-    const runId = generateId('run');
-    const run = mockApi.createRunJob(project.id, 'generate-images', `Retry ${failed.length} images`, failed.map(s => s.id));
-    dispatch({ type: 'ADD_RUN', projectId: project.id, payload: run });
-    for (const segment of failed) {
-      await generateSegment(segment, runId);
+    const failedSegments = segmentsWithPrompts
+      .filter((segment) => {
+        const { record, stale } = getImageStateForSegment(segment.index);
+        return !stale && record?.status === 'failed';
+      })
+      .map((segment) => segment.index);
+
+    if (failedSegments.length === 0) {
+      toast('No failed images to retry', 'info');
+      return;
     }
-    dispatch({ type: 'UPDATE_RUN', projectId: project.id, payload: { ...run, status: 'success', completedAt: new Date().toISOString() } });
-    toast('Retry complete', 'success');
+
+    await startGeneration(
+      failedSegments,
+      `Retry ${failedSegments.length} failed image${failedSegments.length === 1 ? '' : 's'}`,
+      'Image retry completed',
+    );
   };
 
   const handleDelete = async () => {
-    if (!deleteTarget) return;
+    if (!deleteTarget) {
+      return;
+    }
     try {
       await mockApi.deleteImage(project.id, deleteTarget.id);
       dispatch({ type: 'DELETE_IMAGE', projectId: project.id, id: deleteTarget.id });
@@ -166,7 +134,6 @@ export default function GenerateImagesTab({ project, images }: Props) {
     const { record, stale } = getImageStateForSegment(segment.index);
     return !stale && record?.status === 'failed';
   }).length;
-  const anyRunning = running.size > 0;
 
   return (
     <Box sx={{ p: { xs: 2, md: 4 }, height: '100%', overflow: 'auto' }}>
@@ -178,15 +145,40 @@ export default function GenerateImagesTab({ project, images }: Props) {
           </Typography>
         </Box>
         <Stack direction="row" spacing={1} flexWrap="wrap">
-          <Button size="small" variant="outlined" onClick={handleGenerateAll} disabled={anyRunning} startIcon={<ImageOutlinedIcon />}>
+          <Button
+            size="small"
+            variant="outlined"
+            onClick={() => void startGeneration(
+              segmentsWithPrompts.map((segment) => segment.index),
+              `Generate ${segmentsWithPrompts.length} scene image${segmentsWithPrompts.length === 1 ? '' : 's'}`,
+              'Image generation complete',
+            )}
+            disabled={submitting || anyRunning || segmentsWithPrompts.length === 0}
+            startIcon={<ImageOutlinedIcon />}
+          >
             All
           </Button>
-          <Button size="small" variant="outlined" onClick={handleGenerateSelected} disabled={anyRunning || selected.size === 0}>
+          <Button
+            size="small"
+            variant="outlined"
+            onClick={() => void startGeneration(
+              Array.from(selected),
+              `Generate ${selected.size} selected image${selected.size === 1 ? '' : 's'}`,
+              `Generated ${selected.size} image${selected.size === 1 ? '' : 's'}`,
+            )}
+            disabled={submitting || anyRunning || selected.size === 0}
+          >
             Selected ({selected.size})
           </Button>
           {failedCount > 0 && (
-            <Button size="small" variant="outlined" color="warning" onClick={handleRetryFailed} disabled={anyRunning}
-              startIcon={<RefreshIcon />}>
+            <Button
+              size="small"
+              variant="outlined"
+              color="warning"
+              onClick={() => void handleRetryFailed()}
+              disabled={submitting || anyRunning}
+              startIcon={<RefreshIcon />}
+            >
               Retry ({failedCount})
             </Button>
           )}
@@ -202,8 +194,7 @@ export default function GenerateImagesTab({ project, images }: Props) {
 
       {staleImages.length > 0 && (
         <Alert severity="warning" sx={{ mb: 3 }}>
-          {staleImages.length} generated image{staleImages.length > 1 ? 's are' : ' is'} tied to an older
-          script/parser state and will not be reused until regenerated.
+          {staleImages.length} generated image{staleImages.length > 1 ? 's are' : ' is'} tied to an older script/parser state and should be regenerated before render.
         </Alert>
       )}
 
@@ -213,57 +204,63 @@ export default function GenerateImagesTab({ project, images }: Props) {
           checked={selected.size === segmentsWithPrompts.length && segmentsWithPrompts.length > 0}
           indeterminate={selected.size > 0 && selected.size < segmentsWithPrompts.length}
           onChange={() => {
-            if (selected.size === segmentsWithPrompts.length) setSelected(new Set());
-            else setSelected(new Set(segmentsWithPrompts.map(s => s.index)));
+            if (selected.size === segmentsWithPrompts.length) {
+              setSelected(new Set());
+            } else {
+              setSelected(new Set(segmentsWithPrompts.map((segment) => segment.index)));
+            }
           }}
         />
         <Typography variant="caption" color="text.secondary">Select all with prompts</Typography>
       </Stack>
 
       <Grid container spacing={2}>
-        {segmentsWithPrompts.map(seg => {
-          const { record: img, stale } = getImageStateForSegment(seg.index);
-          const isRunning = running.has(seg.index);
-          const prog = progress[seg.index] ?? (img?.progress ?? 0);
-          const status = isRunning ? 'running' : (img?.status ?? 'idle');
+        {segmentsWithPrompts.map((segment) => {
+          const { record: image, stale } = getImageStateForSegment(segment.index);
+          const status = image?.status ?? 'idle';
 
           return (
-            <Grid key={seg.id} size={{ xs: 12, sm: 6, lg: 4 }}>
-              <Card sx={{ border: t => `1px solid ${alpha(t.palette.divider, 0.4)}`, borderRadius: 2, overflow: 'hidden' }}>
+            <Grid key={segment.id} size={{ xs: 12, sm: 6, lg: 4 }}>
+              <Card sx={{ border: (theme) => `1px solid ${alpha(theme.palette.divider, 0.4)}`, borderRadius: 2, overflow: 'hidden' }}>
                 <Box sx={{ position: 'relative' }}>
-                  {img?.thumbnailUrl ? (
+                  {image?.thumbnailUrl ? (
                     <CardMedia
                       component="img"
-                      image={img.thumbnailUrl}
-                      alt={seg.imagePrompt ?? ''}
+                      image={image.thumbnailUrl}
+                      alt={segment.imagePrompt ?? ''}
                       sx={{ height: 140, objectFit: 'cover' }}
                     />
                   ) : (
                     <Box sx={{
-                      height: 140, display: 'flex', alignItems: 'center', justifyContent: 'center',
-                      bgcolor: t => alpha(t.palette.primary.main, 0.05),
-                      border: t => `1px dashed ${alpha(t.palette.primary.main, 0.2)}`,
+                      height: 140,
+                      display: 'flex',
+                      alignItems: 'center',
+                      justifyContent: 'center',
+                      bgcolor: (theme) => alpha(theme.palette.primary.main, 0.05),
+                      border: (theme) => `1px dashed ${alpha(theme.palette.primary.main, 0.2)}`,
                     }}>
-                      <ImageOutlinedIcon sx={{ fontSize: 40, color: 'text.secondary', opacity: 0.3 }} />
+                      <ImageOutlinedIcon sx={{ fontSize: 40, color: 'text.secondary', opacity: 0.6 }} />
                     </Box>
                   )}
-                  {isRunning && (
+                  {status === 'running' && (
                     <Box sx={{ position: 'absolute', bottom: 0, left: 0, right: 0 }}>
-                      <LinearProgress variant="determinate" value={prog} sx={{ height: 3 }} />
+                      <LinearProgress variant="indeterminate" sx={{ height: 3 }} />
                     </Box>
                   )}
                   <Box sx={{ position: 'absolute', top: 8, left: 8 }}>
                     <Checkbox
                       size="small"
-                      checked={selected.has(seg.index)}
-                      onChange={() => toggleSelect(seg.index)}
-                      disabled={isRunning}
-                      sx={{ bgcolor: t => alpha(t.palette.background.paper, 0.8), borderRadius: 1, p: 0.25 }}
+                      checked={selected.has(segment.index)}
+                      onChange={() => toggleSelect(segment.index)}
+                      disabled={status === 'running'}
+                      sx={{ bgcolor: (theme) => alpha(theme.palette.background.paper, 0.8), borderRadius: 1, p: 0.25 }}
                     />
                   </Box>
-                    <Box sx={{ position: 'absolute', top: 8, right: 8 }}>
+                  <Box sx={{ position: 'absolute', top: 8, right: 8 }}>
                     <Stack direction="row" spacing={0.5} alignItems="center">
-                      {stale && !isRunning && <Chip label="Stale" size="small" color="warning" sx={{ height: 20, fontSize: '0.62rem' }} />}
+                      {stale && status !== 'running' && (
+                        <Chip label="Stale" size="small" color="warning" sx={{ height: 20, fontSize: '0.62rem' }} />
+                      )}
                       <StatusChip status={status} />
                     </Stack>
                   </Box>
@@ -271,33 +268,56 @@ export default function GenerateImagesTab({ project, images }: Props) {
                 <CardContent sx={{ p: 1.5, '&:last-child': { pb: 1.5 } }}>
                   <Stack direction="row" justifyContent="space-between" alignItems="flex-start">
                     <Box flexGrow={1} minWidth={0} mr={1}>
-                      <Typography variant="caption" fontWeight={700} color="primary.main" display="block">Seg #{seg.index + 1}</Typography>
+                      <Typography variant="caption" fontWeight={700} color="primary.main" display="block">Seg #{segment.index + 1}</Typography>
                       <Typography variant="caption" color="text.secondary" sx={{
-                        display: '-webkit-box', WebkitLineClamp: 2, WebkitBoxOrient: 'vertical', overflow: 'hidden', fontSize: '0.72rem',
+                        display: '-webkit-box',
+                        WebkitLineClamp: 2,
+                        WebkitBoxOrient: 'vertical',
+                        overflow: 'hidden',
+                        fontSize: '0.72rem',
                       }}>
-                        {seg.imagePrompt}
+                        {segment.imagePrompt}
                       </Typography>
-                      {img && (
+                      {image && (
                         <Typography variant="caption" color="text.secondary" display="block" mt={0.5}>
-                          {img.width}×{img.height}
+                          {image.width}×{image.height}
                         </Typography>
                       )}
                     </Box>
                     <Stack direction="row" spacing={0.25}>
-                      {img?.thumbnailUrl && (
-                        <Tooltip title="Download">
-                          <IconButton size="small"><DownloadIcon sx={{ fontSize: 14 }} /></IconButton>
+                      {image?.thumbnailUrl && (
+                        <Tooltip title="Export">
+                          <span>
+                            <IconButton
+                              size="small"
+                              onClick={() => image.thumbnailUrl && exportAsset(
+                                image.thumbnailUrl,
+                                filenameFromAssetUrl(image.thumbnailUrl, `segment-${segment.index + 1}.png`),
+                              ).catch((error: Error) => toast(error.message, 'error'))}
+                              disabled={!image.thumbnailUrl}
+                            >
+                              <DownloadIcon sx={{ fontSize: 14 }} />
+                            </IconButton>
+                          </span>
                         </Tooltip>
                       )}
-                      {img && (
+                      {image && (
                         <Tooltip title="Delete">
-                          <IconButton size="small" onClick={() => setDeleteTarget(img)} sx={{ color: 'error.main' }}>
+                          <IconButton size="small" onClick={() => setDeleteTarget(image)} sx={{ color: 'error.main' }}>
                             <DeleteOutlineIcon sx={{ fontSize: 14 }} />
                           </IconButton>
                         </Tooltip>
                       )}
-                      <Tooltip title={img ? 'Regenerate' : 'Generate'}>
-                        <IconButton size="small" disabled={anyRunning} onClick={() => generateSegment(seg, generateId('run'))}>
+                      <Tooltip title={image ? 'Regenerate' : 'Generate'}>
+                        <IconButton
+                          size="small"
+                          disabled={submitting || anyRunning}
+                          onClick={() => void startGeneration(
+                            [segment.index],
+                            `${image ? 'Regenerate' : 'Generate'} image for segment ${segment.index + 1}`,
+                            `Image for segment ${segment.index + 1} is ready`,
+                          )}
+                        >
                           <RefreshIcon sx={{ fontSize: 14 }} />
                         </IconButton>
                       </Tooltip>
@@ -312,11 +332,13 @@ export default function GenerateImagesTab({ project, images }: Props) {
 
       {segmentsWithPrompts.length === 0 && (
         <Box sx={{
-          textAlign: 'center', py: 8,
-          border: t => `2px dashed ${alpha(t.palette.divider, 0.4)}`,
-          borderRadius: 3, mt: 3,
+          textAlign: 'center',
+          py: 8,
+          border: (theme) => `2px dashed ${alpha(theme.palette.divider, 0.4)}`,
+          borderRadius: 3,
+          mt: 3,
         }}>
-          <ImageNotSupportedIcon sx={{ fontSize: 48, color: 'text.secondary', opacity: 0.3, mb: 1 }} />
+          <ImageNotSupportedIcon sx={{ fontSize: 48, color: 'text.secondary', opacity: 0.65, mb: 1 }} />
           <Typography variant="body1" color="text.secondary" fontWeight={600}>No image prompts found</Typography>
           <Typography variant="body2" color="text.secondary">
             Add <code>&lt;image&gt;your prompt&lt;/image&gt;</code> tags to your script segments

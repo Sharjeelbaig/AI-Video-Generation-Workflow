@@ -16,6 +16,7 @@ import Typography from '@mui/material/Typography';
 import CircularProgress from '@mui/material/CircularProgress';
 import { alpha } from '@mui/material/styles';
 import type { AspectRatio, Language } from '../../types';
+import { validateProjectInput } from '../../services/validation';
 
 const ASPECT_RATIOS: { value: AspectRatio; label: string; desc: string }[] = [
   { value: '16:9', label: '16:9', desc: 'Landscape (YouTube)' },
@@ -39,10 +40,19 @@ export default function CreateProjectModal({ open, onClose, onSubmit }: Props) {
   const [error, setError] = useState('');
 
   const handleSubmit = async () => {
-    if (!name.trim()) { setError('Project name is required'); return; }
+    const validation = validateProjectInput({
+      name,
+      description,
+      language,
+      aspectRatio,
+    });
+    if (!validation.success) {
+      setError(validation.message);
+      return;
+    }
     setLoading(true);
     try {
-      await onSubmit({ name: name.trim(), description: description.trim(), language, aspectRatio });
+      await onSubmit(validation.data);
       handleClose();
     } catch {
       setError('Failed to create project');

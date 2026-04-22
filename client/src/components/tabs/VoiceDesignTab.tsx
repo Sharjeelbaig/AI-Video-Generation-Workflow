@@ -29,9 +29,10 @@ import StatusChip from '../common/StatusChip';
 import EmptyState from '../common/EmptyState';
 import ConfirmDialog from '../common/ConfirmDialog';
 import MediaPreviewDialog, { type MediaPreviewTarget } from '../common/MediaPreviewDialog';
-import { mockApi, generateId } from '../../services/mockApi';
+import { mockApi } from '../../services/mockApi';
 import { useApp } from '../../store/AppContext';
 import { formatOptionalSeconds } from '../../utils/outputStability';
+import { validateVoiceDesignInput } from '../../services/validation';
 
 interface Props {
   project: Project;
@@ -49,7 +50,7 @@ function timeAgo(iso: string): string {
 }
 
 export default function VoiceDesignTab({ project, voiceDesigns }: Props) {
-  const { dispatch, toast } = useApp();
+  const { dispatch, toast, trackRun, refreshDesignedVoices } = useApp();
   const [name, setName] = useState('');
   const [prompt, setPrompt] = useState('');
   const [refText, setRefText] = useState('');
@@ -61,38 +62,32 @@ export default function VoiceDesignTab({ project, voiceDesigns }: Props) {
   const [previewTarget, setPreviewTarget] = useState<MediaPreviewTarget | null>(null);
 
   const handleDesign = async () => {
-    if (!name.trim() || !prompt.trim()) {
-      toast('Please fill in name and voice prompt', 'warning');
+    const validation = validateVoiceDesignInput({
+      name,
+      promptInstruction: prompt,
+      referenceText: refText,
+      speed,
+      tonePreset: tone,
+      narrationMood: mood,
+    });
+    if (!validation.success) {
+      toast(validation.message, 'warning');
       return;
     }
     setLoading(true);
-    const runId = generateId('run');
-    const run = mockApi.createRunJob(project.id, 'voice-design', `Design voice: ${name}`, []);
-    dispatch({ type: 'ADD_RUN', projectId: project.id, payload: { ...run, id: runId } });
 
     try {
-      const vd = await mockApi.designVoice(project.id, {
-        name: name.trim(), promptInstruction: prompt, referenceText: refText,
-        speed, tonePreset: tone, narrationMood: mood,
+      const response = await mockApi.requestVoiceDesign(project.id, validation.data);
+      dispatch({ type: 'ADD_VOICE_DESIGN', projectId: project.id, payload: response.voiceDesign });
+      trackRun(project.id, response.run, {
+        successMessage: `Voice "${validation.data.name}" designed successfully`,
+        failureMessage: `Voice "${validation.data.name}" could not be designed`,
+        refreshDesignedVoices: true,
       });
-      dispatch({ type: 'ADD_VOICE_DESIGN', projectId: project.id, payload: vd });
-      const designedVoices = await mockApi.listDesignedVoices();
-      dispatch({ type: 'SET_DESIGNED_VOICES', payload: designedVoices });
-      dispatch({
-        type: 'UPDATE_RUN',
-        projectId: project.id,
-        payload: { ...run, id: runId, status: 'success', completedAt: new Date().toISOString() },
-      });
-      const refreshedProject = await mockApi.getProject(project.id);
-      dispatch({ type: 'UPDATE_PROJECT', payload: refreshedProject });
-      toast(`Voice "${name}" designed successfully`, 'success');
-      setName(''); setPrompt(''); setRefText('');
+      setName('');
+      setPrompt('');
+      setRefText('');
     } catch (e) {
-      dispatch({
-        type: 'UPDATE_RUN',
-        projectId: project.id,
-        payload: { ...run, id: runId, status: 'failed', completedAt: new Date().toISOString() },
-      });
       toast((e as Error).message, 'error');
     } finally {
       setLoading(false);
@@ -125,8 +120,7 @@ export default function VoiceDesignTab({ project, voiceDesigns }: Props) {
     try {
       await mockApi.deleteVoiceDesign(project.id, deleteTarget.id);
       dispatch({ type: 'DELETE_VOICE_DESIGN', projectId: project.id, id: deleteTarget.id });
-      const designedVoices = await mockApi.listDesignedVoices();
-      dispatch({ type: 'SET_DESIGNED_VOICES', payload: designedVoices });
+      await refreshDesignedVoices();
       if (project.defaultVoiceDesignId === deleteTarget.id) {
         const refreshedProject = await mockApi.getProject(project.id);
         dispatch({ type: 'UPDATE_PROJECT', payload: refreshedProject });

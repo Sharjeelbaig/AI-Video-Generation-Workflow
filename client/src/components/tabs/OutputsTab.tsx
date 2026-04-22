@@ -1,4 +1,4 @@
-import { useState, useMemo } from 'react';
+import { useDeferredValue, useMemo, useState } from 'react';
 import Box from '@mui/material/Box';
 import Typography from '@mui/material/Typography';
 import Card from '@mui/material/Card';
@@ -29,12 +29,14 @@ import ImageOutlinedIcon from '@mui/icons-material/ImageOutlined';
 import MovieOutlinedIcon from '@mui/icons-material/MovieOutlined';
 import RecordVoiceOverOutlinedIcon from '@mui/icons-material/RecordVoiceOverOutlined';
 import type { Project, VoiceDesign, GeneratedAudio, GeneratedImage, GeneratedVideo } from '../../types';
+import type { TabId } from '../workspace/WorkspaceLayout';
 import StatusChip from '../common/StatusChip';
 import EmptyState from '../common/EmptyState';
 import ConfirmDialog from '../common/ConfirmDialog';
 import MediaPreviewDialog, { type MediaPreviewTarget } from '../common/MediaPreviewDialog';
 import { useApp } from '../../store/AppContext';
 import { mockApi } from '../../services/mockApi';
+import { exportAsset, filenameFromAssetUrl } from '../../services/fileExport';
 import {
   formatOptionalRoundedSeconds,
   formatOptionalSeconds,
@@ -47,6 +49,7 @@ interface Props {
   audios: GeneratedAudio[];
   images: GeneratedImage[];
   videos: GeneratedVideo[];
+  onNavigate: (tab: TabId) => void;
 }
 
 function timeAgo(iso: string): string {
@@ -59,14 +62,15 @@ function timeAgo(iso: string): string {
   return `${Math.floor(h / 24)}d ago`;
 }
 
-export default function OutputsTab({ project, voiceDesigns, audios, images, videos }: Props) {
+export default function OutputsTab({ project, voiceDesigns, audios, images, videos, onNavigate }: Props) {
   const { dispatch, toast } = useApp();
-  const safeVoiceDesigns = Array.isArray(voiceDesigns) ? voiceDesigns : [];
-  const safeAudios = Array.isArray(audios) ? audios : [];
-  const safeImages = Array.isArray(images) ? images : [];
-  const safeVideos = Array.isArray(videos) ? videos : [];
+  const safeVoiceDesigns = useMemo(() => (Array.isArray(voiceDesigns) ? voiceDesigns : []), [voiceDesigns]);
+  const safeAudios = useMemo(() => (Array.isArray(audios) ? audios : []), [audios]);
+  const safeImages = useMemo(() => (Array.isArray(images) ? images : []), [images]);
+  const safeVideos = useMemo(() => (Array.isArray(videos) ? videos : []), [videos]);
   const [tabIdx, setTabIdx] = useState(0);
   const [search, setSearch] = useState('');
+  const deferredSearch = useDeferredValue(search);
   const [statusFilter, setStatusFilter] = useState('all');
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [deleteTarget, setDeleteTarget] = useState<{ type: string; id: string; label: string } | null>(null);
@@ -80,24 +84,24 @@ export default function OutputsTab({ project, voiceDesigns, audios, images, vide
   ];
 
   const filteredVoices = useMemo(() => safeVoiceDesigns.filter(v =>
-    (!search || v.name.toLowerCase().includes(search.toLowerCase())) &&
+    (!deferredSearch || v.name.toLowerCase().includes(deferredSearch.toLowerCase())) &&
     (statusFilter === 'all' || v.status === statusFilter)
-  ), [safeVoiceDesigns, search, statusFilter]);
+  ), [safeVoiceDesigns, deferredSearch, statusFilter]);
 
   const filteredAudios = useMemo(() => safeAudios.filter(a =>
-    (!search || String(a.segmentIndex + 1).includes(search)) &&
+    (!deferredSearch || String(a.segmentIndex + 1).includes(deferredSearch)) &&
     (statusFilter === 'all' || a.status === statusFilter)
-  ), [safeAudios, search, statusFilter]);
+  ), [safeAudios, deferredSearch, statusFilter]);
 
   const filteredImages = useMemo(() => safeImages.filter(i =>
-    (!search || i.prompt.toLowerCase().includes(search.toLowerCase()) || String(i.segmentIndex + 1).includes(search)) &&
+    (!deferredSearch || i.prompt.toLowerCase().includes(deferredSearch.toLowerCase()) || String(i.segmentIndex + 1).includes(deferredSearch)) &&
     (statusFilter === 'all' || i.status === statusFilter)
-  ), [safeImages, search, statusFilter]);
+  ), [safeImages, deferredSearch, statusFilter]);
 
   const filteredVideos = useMemo(() => safeVideos.filter(v =>
-    (!search || v.filename.toLowerCase().includes(search.toLowerCase())) &&
+    (!deferredSearch || v.filename.toLowerCase().includes(deferredSearch.toLowerCase())) &&
     (statusFilter === 'all' || v.status === statusFilter)
-  ), [safeVideos, search, statusFilter]);
+  ), [safeVideos, deferredSearch, statusFilter]);
 
   const toggleSelect = (id: string) => {
     setSelected(prev => {
@@ -267,6 +271,11 @@ export default function OutputsTab({ project, voiceDesigns, audios, images, vide
                         <Typography variant="caption" color="text.secondary">
                           {formatOptionalSeconds(a.duration)} · {timeAgo(a.createdAt)} · Run: {a.runId.slice(-6)}
                         </Typography>
+                        {isStaleOutputRecord(a, project.scriptContent) && (
+                          <Button size="small" sx={{ mt: 0.5, px: 0 }} onClick={() => onNavigate('generate-voice')}>
+                            Regenerate in Voice tab
+                          </Button>
+                        )}
                       </Box>
                       <Stack direction="row">
                         {a.status === 'success' && (
@@ -286,7 +295,20 @@ export default function OutputsTab({ project, voiceDesigns, audios, images, vide
                                 </IconButton>
                               </span>
                             </Tooltip>
-                            <Tooltip title="Download"><IconButton size="small"><DownloadIcon sx={{ fontSize: 14 }} /></IconButton></Tooltip>
+                            <Tooltip title="Export">
+                              <span>
+                                <IconButton
+                                  size="small"
+                                  onClick={() => a.audioUrl && exportAsset(
+                                    a.audioUrl,
+                                    filenameFromAssetUrl(a.audioUrl, `segment-${a.segmentIndex + 1}.wav`),
+                                  ).catch((error: Error) => toast(error.message, 'error'))}
+                                  disabled={!a.audioUrl}
+                                >
+                                  <DownloadIcon sx={{ fontSize: 14 }} />
+                                </IconButton>
+                              </span>
+                            </Tooltip>
                           </>
                         )}
                         <Tooltip title="Delete">
@@ -338,8 +360,28 @@ export default function OutputsTab({ project, voiceDesigns, audios, images, vide
                       }}>
                         {img.prompt}
                       </Typography>
+                      {isStaleOutputRecord(img, project.scriptContent) && (
+                        <Button size="small" sx={{ mt: 0.5, px: 0 }} onClick={() => onNavigate('generate-images')}>
+                          Regenerate in Images tab
+                        </Button>
+                      )}
                       <Stack direction="row" spacing={0.25} mt={0.75}>
-                        {img.thumbnailUrl && <Tooltip title="Download"><IconButton size="small"><DownloadIcon sx={{ fontSize: 12 }} /></IconButton></Tooltip>}
+                        {img.thumbnailUrl && (
+                          <Tooltip title="Export">
+                            <span>
+                              <IconButton
+                                size="small"
+                                onClick={() => img.thumbnailUrl && exportAsset(
+                                  img.thumbnailUrl,
+                                  filenameFromAssetUrl(img.thumbnailUrl, `segment-${img.segmentIndex + 1}.png`),
+                                ).catch((error: Error) => toast(error.message, 'error'))}
+                                disabled={!img.thumbnailUrl}
+                              >
+                                <DownloadIcon sx={{ fontSize: 12 }} />
+                              </IconButton>
+                            </span>
+                          </Tooltip>
+                        )}
                         <Tooltip title="Delete">
                           <IconButton size="small" onClick={() => setDeleteTarget({ type: 'image', id: img.id, label: `Seg #${img.segmentIndex + 1} image` })} sx={{ color: 'error.main' }}>
                             <DeleteOutlineIcon sx={{ fontSize: 12 }} />
@@ -375,6 +417,11 @@ export default function OutputsTab({ project, voiceDesigns, audios, images, vide
                           <Typography variant="caption" color="text.secondary">
                             {formatOptionalRoundedSeconds(v.duration)} · {timeAgo(v.createdAt)}
                           </Typography>
+                          {isStaleOutputRecord(v, project.scriptContent) && (
+                            <Button size="small" sx={{ mt: 0.5, px: 0 }} onClick={() => onNavigate('generate-video')}>
+                              Regenerate in Video tab
+                            </Button>
+                          )}
                         </Box>
                         <Stack direction="row" spacing={0.5} alignItems="center">
                           {isStaleOutputRecord(v, project.scriptContent) && (
@@ -400,7 +447,20 @@ export default function OutputsTab({ project, voiceDesigns, audios, images, vide
                             </IconButton>
                           </span>
                         </Tooltip>
-                        <Tooltip title="Download"><IconButton size="small"><DownloadIcon sx={{ fontSize: 14 }} /></IconButton></Tooltip>
+                        <Tooltip title="Export">
+                          <span>
+                            <IconButton
+                              size="small"
+                              onClick={() => v.videoUrl && exportAsset(
+                                v.videoUrl,
+                                filenameFromAssetUrl(v.videoUrl, v.filename),
+                              ).catch((error: Error) => toast(error.message, 'error'))}
+                              disabled={!v.videoUrl}
+                            >
+                              <DownloadIcon sx={{ fontSize: 14 }} />
+                            </IconButton>
+                          </span>
+                        </Tooltip>
                         <Tooltip title="Delete">
                           <IconButton size="small" onClick={() => setDeleteTarget({ type: 'video', id: v.id, label: v.filename })} sx={{ color: 'error.main' }}>
                             <DeleteOutlineIcon sx={{ fontSize: 14 }} />

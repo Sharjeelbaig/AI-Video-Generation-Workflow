@@ -1,4 +1,4 @@
-import { useState, useMemo, useCallback } from 'react';
+import { useState, useMemo, useCallback, useEffect } from 'react';
 import Box from '@mui/material/Box';
 import Typography from '@mui/material/Typography';
 import TextField from '@mui/material/TextField';
@@ -19,6 +19,7 @@ import type { Project } from '../../types';
 import { parseScript, isRTL } from '../../services/scriptParser';
 import { useApp } from '../../store/AppContext';
 import { mockApi } from '../../services/mockApi';
+import { validateScriptContent } from '../../services/validation';
 
 interface Props {
   project: Project;
@@ -28,6 +29,12 @@ export default function ScriptTab({ project }: Props) {
   const { dispatch, toast } = useApp();
   const [content, setContent] = useState(project.scriptContent);
   const [dirty, setDirty] = useState(false);
+  const [saving, setSaving] = useState(false);
+
+  useEffect(() => {
+    setContent(project.scriptContent);
+    setDirty(false);
+  }, [project.id, project.scriptContent]);
 
   const segments = useMemo(() => parseScript(content, project.id), [content, project.id]);
 
@@ -37,14 +44,23 @@ export default function ScriptTab({ project }: Props) {
   }, [project.scriptContent]);
 
   const handleSave = async () => {
+    const validation = validateScriptContent(content);
+    if (!validation.success) {
+      toast(validation.message, 'warning');
+      return;
+    }
+
+    setSaving(true);
     try {
-      const response = await mockApi.saveScript(project.id, content);
+      const response = await mockApi.saveScript(project.id, validation.data);
       dispatch({ type: 'UPDATE_PROJECT', payload: response.project });
       setContent(response.content);
       setDirty(false);
       toast('Script saved', 'success');
     } catch (error) {
       toast((error as Error).message, 'error');
+    } finally {
+      setSaving(false);
     }
   };
 
@@ -82,10 +98,10 @@ export default function ScriptTab({ project }: Props) {
             size="small"
             startIcon={<SaveOutlinedIcon />}
             onClick={handleSave}
-            disabled={!dirty}
+            disabled={!dirty || saving}
             color={dirty ? 'primary' : 'inherit'}
           >
-            {dirty ? 'Save' : 'Saved'}
+            {saving ? 'Saving…' : dirty ? 'Save' : 'Saved'}
           </Button>
         </Stack>
 

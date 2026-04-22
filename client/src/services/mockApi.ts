@@ -1,30 +1,33 @@
 import type {
-  Project,
-  VoiceDesign,
+  AppSettings,
+  AspectRatio,
   DesignedVoiceAsset,
   GeneratedAudio,
   GeneratedImage,
   GeneratedVideo,
-  RunJob,
-  VideoSettings,
   Language,
-  AspectRatio,
+  Project,
+  RunEvent,
+  RunJob,
   ScriptSegment,
-  VideoStage,
+  VideoSettings,
+  VoiceDesign,
 } from '../types';
 
-type EventPayload = {
-  type: string;
-  [key: string]: unknown;
+const API_BASE = '/api';
+
+type RunSubscriptionHandlers = {
+  onEvent: (event: RunEvent) => void;
+  onError?: (error: Error) => void;
 };
 
-const API_BASE = '/api';
+type JsonBody = Record<string, unknown> | undefined;
 
 function normalizeListResponse<T>(value: unknown, label: string): T[] {
   if (Array.isArray(value)) {
     return value as T[];
   }
-  console.warn(`[mockApi] Expected ${label} to be an array but received`, value);
+  console.warn(`[api] Expected ${label} to be an array but received`, value);
   return [];
 }
 
@@ -35,7 +38,7 @@ export function generateId(prefix = 'id'): string {
 async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
   const response = await fetch(`${API_BASE}${path}`, {
     headers: {
-      'Content-Type': 'application/json',
+      ...(init.body ? { 'Content-Type': 'application/json' } : {}),
       ...(init.headers || {}),
     },
     ...init,
@@ -45,9 +48,9 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
     let message = `Request failed: ${response.status}`;
     try {
       const body = await response.json();
-      message = body?.detail || body?.message || message;
+      message = body?.error?.message || body?.message || body?.detail || message;
     } catch {
-      // Keep default message when response is not JSON.
+      // Keep fallback message when the body is not JSON.
     }
     throw new Error(message);
   }
@@ -59,68 +62,46 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
   return response.json() as Promise<T>;
 }
 
-function createSseUrl(path: string): string {
-  return `${API_BASE}${path}`;
+function post<T>(path: string, body?: JsonBody): Promise<T> {
+  return request<T>(path, {
+    method: 'POST',
+    body: body ? JSON.stringify(body) : undefined,
+  });
 }
 
-async function awaitRunCompletion(
-  projectId: string,
-  runId: string,
-  onEvent: (event: EventPayload) => void,
-): Promise<RunJob> {
-  return new Promise<RunJob>((resolve, reject) => {
-    const eventSource = new EventSource(createSseUrl(`/projects/${projectId}/runs/${runId}/events`));
-
-    let finalRun: RunJob | null = null;
-
-    eventSource.onmessage = (message) => {
-      let payload: EventPayload;
-      try {
-        payload = JSON.parse(message.data) as EventPayload;
-      } catch {
-        return;
-      }
-
-      onEvent(payload);
-
-      if (payload.type === 'run-update' || payload.type === 'run-snapshot') {
-        finalRun = payload.run as RunJob;
-      }
-
-      if (payload.type === 'run-completed') {
-        finalRun = (payload.run as RunJob) || finalRun;
-        eventSource.close();
-        if (finalRun) {
-          resolve(finalRun);
-          return;
-        }
-        reject(new Error('Run completed without run payload'));
-      }
-
-      if (payload.type === 'run-failed') {
-        const run = (payload.run as RunJob) || finalRun;
-        const errorMessage = typeof payload.message === 'string'
-          ? payload.message
-          : 'Run failed';
-        eventSource.close();
-        if (run) {
-          reject(new Error(errorMessage));
-        } else {
-          reject(new Error('Run failed without run payload'));
-        }
-      }
-    };
-
-    eventSource.onerror = () => {
-      eventSource.close();
-      reject(new Error('Run event stream disconnected'));
-    };
+function put<T>(path: string, body?: JsonBody): Promise<T> {
+  return request<T>(path, {
+    method: 'PUT',
+    body: body ? JSON.stringify(body) : undefined,
   });
+}
+
+function patch<T>(path: string, body?: JsonBody): Promise<T> {
+  return request<T>(path, {
+    method: 'PATCH',
+    body: body ? JSON.stringify(body) : undefined,
+  });
+}
+
+function del(path: string): Promise<void> {
+  return request<void>(path, { method: 'DELETE' });
+}
+
+function createSseUrl(path: string): string {
+  return `${API_BASE}${path}`;
 }
 
 export const mockApi = {
   async healthCheck(): Promise<{ status: string }> {
     return request<{ status: string }>('/health');
+  },
+
+  async getSettings(): Promise<AppSettings> {
+    return request<AppSettings>('/settings');
+  },
+
+  async updateSettings(projectsDirectory: string): Promise<AppSettings> {
+    return put<AppSettings>('/settings', { projectsDirectory });
   },
 
   async listProjects(): Promise<Project[]> {
@@ -138,29 +119,19 @@ export const mockApi = {
     language: Language;
     aspectRatio: AspectRatio;
   }): Promise<Project> {
-    return request<Project>('/projects', {
-      method: 'POST',
-      body: JSON.stringify(data),
-    });
+    return post<Project>('/projects', data);
   },
 
-  async updateProject(projectId: string, patch: Partial<Project>): Promise<Project> {
-    return request<Project>(`/projects/${projectId}`, {
-      method: 'PATCH',
-      body: JSON.stringify(patch),
-    });
+  async updateProject(projectId: string, patchBody: Partial<Project>): Promise<Project> {
+    return patch<Project>(`/projects/${projectId}`, patchBody);
   },
 
   async duplicateProject(projectId: string): Promise<Project> {
-    return request<Project>(`/projects/${projectId}/duplicate`, {
-      method: 'POST',
-    });
+    return post<Project>(`/projects/${projectId}/duplicate`);
   },
 
   async deleteProject(projectId: string): Promise<void> {
-    await request<{ status: string }>(`/projects/${projectId}`, {
-      method: 'DELETE',
-    });
+    return del(`/projects/${projectId}`);
   },
 
   async getScript(projectId: string): Promise<{ content: string; segments: ScriptSegment[]; project: Project }> {
@@ -168,10 +139,7 @@ export const mockApi = {
   },
 
   async saveScript(projectId: string, content: string): Promise<{ content: string; segments: ScriptSegment[]; project: Project }> {
-    return request<{ content: string; segments: ScriptSegment[]; project: Project }>(`/projects/${projectId}/script`, {
-      method: 'PUT',
-      body: JSON.stringify({ content }),
-    });
+    return put<{ content: string; segments: ScriptSegment[]; project: Project }>(`/projects/${projectId}/script`, { content });
   },
 
   async listVoiceDesigns(projectId: string): Promise<VoiceDesign[]> {
@@ -184,20 +152,7 @@ export const mockApi = {
     return normalizeListResponse<DesignedVoiceAsset>(response, 'designed voices');
   },
 
-  async deleteVoiceDesign(projectId: string, voiceDesignId: string): Promise<void> {
-    await request<{ status: string }>(`/projects/${projectId}/voice-designs/${voiceDesignId}`, {
-      method: 'DELETE',
-    });
-  },
-
-  async setDefaultVoice(projectId: string, voiceDesignId: string): Promise<{ project: Project; voiceDesign: VoiceDesign }> {
-    return request<{ project: Project; voiceDesign: VoiceDesign }>(`/projects/${projectId}/default-voice`, {
-      method: 'POST',
-      body: JSON.stringify({ voiceDesignId }),
-    });
-  },
-
-  async designVoice(
+  async requestVoiceDesign(
     projectId: string,
     params: {
       name: string;
@@ -206,25 +161,21 @@ export const mockApi = {
       speed: number;
       tonePreset: VoiceDesign['tonePreset'];
       narrationMood: VoiceDesign['narrationMood'];
+      setAsDefault?: boolean;
     },
-  ): Promise<VoiceDesign> {
-    const response = await request<{ run: RunJob; voiceDesign: VoiceDesign }>(`/projects/${projectId}/voice-designs`, {
-      method: 'POST',
-      body: JSON.stringify({
-        ...params,
-        setAsDefault: false,
-      }),
+  ): Promise<{ run: RunJob; voiceDesign: VoiceDesign }> {
+    return post<{ run: RunJob; voiceDesign: VoiceDesign }>(`/projects/${projectId}/voice-designs`, {
+      ...params,
+      setAsDefault: params.setAsDefault ?? false,
     });
+  },
 
-    let latestVoiceDesign = response.voiceDesign;
+  async deleteVoiceDesign(projectId: string, voiceDesignId: string): Promise<void> {
+    return del(`/projects/${projectId}/voice-designs/${voiceDesignId}`);
+  },
 
-    await awaitRunCompletion(projectId, response.run.id, (event) => {
-      if (event.type === 'voice-design-update' && event.voiceDesign) {
-        latestVoiceDesign = event.voiceDesign as VoiceDesign;
-      }
-    });
-
-    return latestVoiceDesign;
+  async setDefaultVoice(projectId: string, voiceDesignId: string): Promise<{ project: Project; voiceDesign: VoiceDesign }> {
+    return post<{ project: Project; voiceDesign: VoiceDesign }>(`/projects/${projectId}/default-voice`, { voiceDesignId });
   },
 
   async listAudios(projectId: string): Promise<GeneratedAudio[]> {
@@ -232,52 +183,27 @@ export const mockApi = {
     return normalizeListResponse<GeneratedAudio>(response, `audios for project ${projectId}`);
   },
 
-  async deleteAudio(projectId: string, audioId: string): Promise<void> {
-    await request<{ status: string }>(`/projects/${projectId}/audios/${audioId}`, {
-      method: 'DELETE',
+  async requestAudioGeneration(
+    projectId: string,
+    params: {
+      segmentIndices?: number[];
+      voiceDesignId?: string | null;
+      designedVoiceId?: string | null;
+      clearExisting?: boolean;
+      speed?: number;
+    },
+  ): Promise<{ run: RunJob }> {
+    return post<{ run: RunJob }>(`/projects/${projectId}/generate-audios`, {
+      segmentIndices: params.segmentIndices,
+      voiceDesignId: params.voiceDesignId || undefined,
+      designedVoiceId: params.designedVoiceId || undefined,
+      clearExisting: params.clearExisting,
+      speed: params.speed,
     });
   },
 
-  async generateAudio(
-    projectId: string,
-    segmentId: string,
-    segmentIndex: number,
-    designedVoiceId: string | null,
-    _runId: string,
-    onProgress: (progress: number) => void,
-  ): Promise<GeneratedAudio> {
-    const response = await request<{ run: RunJob }>(`/projects/${projectId}/generate-audios`, {
-      method: 'POST',
-      body: JSON.stringify({
-        segmentIndices: [segmentIndex],
-        designedVoiceId: designedVoiceId || undefined,
-        clearExisting: false,
-      }),
-    });
-
-    await awaitRunCompletion(projectId, response.run.id, (event) => {
-      if (event.type === 'audio-update' && event.audio) {
-        const audio = event.audio as GeneratedAudio;
-        if (audio.segmentId !== segmentId) {
-          return;
-        }
-        onProgress(audio.progress ?? 0);
-      }
-    });
-
-    const allAudios = await mockApi.listAudios(projectId);
-    const latest = allAudios.find((audio) => audio.segmentId === segmentId && audio.runId === response.run.id)
-      || allAudios.find((audio) => audio.segmentId === segmentId);
-
-    if (!latest) {
-      throw new Error(`Audio generation did not return a result for segment ${segmentIndex + 1}`);
-    }
-
-    if (latest.status === 'failed') {
-      throw new Error(`Audio generation failed for segment ${segmentIndex + 1}`);
-    }
-
-    return latest;
+  async deleteAudio(projectId: string, audioId: string): Promise<void> {
+    return del(`/projects/${projectId}/audios/${audioId}`);
   },
 
   async listImages(projectId: string): Promise<GeneratedImage[]> {
@@ -285,55 +211,20 @@ export const mockApi = {
     return normalizeListResponse<GeneratedImage>(response, `images for project ${projectId}`);
   },
 
-  async deleteImage(projectId: string, imageId: string): Promise<void> {
-    await request<{ status: string }>(`/projects/${projectId}/images/${imageId}`, {
-      method: 'DELETE',
-    });
+  async requestImageGeneration(
+    projectId: string,
+    params: {
+      segmentIndices?: number[];
+      width?: number;
+      height?: number;
+      maxWorkers?: number;
+    },
+  ): Promise<{ run: RunJob }> {
+    return post<{ run: RunJob }>(`/projects/${projectId}/generate-images`, params);
   },
 
-  async generateImage(
-    projectId: string,
-    segmentId: string,
-    segmentIndex: number,
-    _prompt: string,
-    _runId: string,
-    onProgress: (progress: number) => void,
-  ): Promise<GeneratedImage> {
-    const response = await request<{ run: RunJob }>(`/projects/${projectId}/generate-images`, {
-      method: 'POST',
-      body: JSON.stringify({
-        segmentIndices: [segmentIndex],
-      }),
-    });
-
-    await awaitRunCompletion(projectId, response.run.id, (event) => {
-      if (event.type === 'image-progress' && event.segmentIndex === segmentIndex) {
-        const p = typeof event.progress === 'number' ? event.progress : 0;
-        onProgress(p);
-      }
-
-      if (event.type === 'image-update' && event.image) {
-        const image = event.image as GeneratedImage;
-        if (image.segmentId !== segmentId) {
-          return;
-        }
-        onProgress(image.progress ?? 0);
-      }
-    });
-
-    const allImages = await mockApi.listImages(projectId);
-    const latest = allImages.find((image) => image.segmentId === segmentId && image.runId === response.run.id)
-      || allImages.find((image) => image.segmentId === segmentId);
-
-    if (!latest) {
-      throw new Error(`Image generation did not return a result for segment ${segmentIndex + 1}`);
-    }
-
-    if (latest.status === 'failed') {
-      throw new Error(`Image generation failed for segment ${segmentIndex + 1}`);
-    }
-
-    return latest;
+  async deleteImage(projectId: string, imageId: string): Promise<void> {
+    return del(`/projects/${projectId}/images/${imageId}`);
   },
 
   async listVideos(projectId: string): Promise<GeneratedVideo[]> {
@@ -341,52 +232,27 @@ export const mockApi = {
     return normalizeListResponse<GeneratedVideo>(response, `videos for project ${projectId}`);
   },
 
-  async deleteVideo(projectId: string, videoId: string): Promise<void> {
-    await request<{ status: string }>(`/projects/${projectId}/videos/${videoId}`, {
-      method: 'DELETE',
+  async requestVideoGeneration(
+    projectId: string,
+    params: {
+      settings?: VideoSettings;
+      voiceDesignId?: string | null;
+      designedVoiceId?: string | null;
+      autoGenerateAudios?: boolean;
+      autoGenerateImages?: boolean;
+    },
+  ): Promise<{ run: RunJob }> {
+    return post<{ run: RunJob }>(`/projects/${projectId}/generate-video`, {
+      settings: params.settings,
+      voiceDesignId: params.voiceDesignId || undefined,
+      designedVoiceId: params.designedVoiceId || undefined,
+      autoGenerateAudios: params.autoGenerateAudios ?? true,
+      autoGenerateImages: params.autoGenerateImages ?? true,
     });
   },
 
-  async generateVideo(
-    projectId: string,
-    settings: VideoSettings,
-    designedVoiceId: string | null,
-    _runId: string,
-    onStageUpdate: (stages: { label: string; status: 'running' | 'success' | 'failed'; progress: number }[]) => void,
-  ): Promise<GeneratedVideo> {
-    const response = await request<{ run: RunJob }>(`/projects/${projectId}/generate-video`, {
-      method: 'POST',
-      body: JSON.stringify({
-        settings,
-        designedVoiceId: designedVoiceId || undefined,
-        autoGenerateAudios: true,
-        autoGenerateImages: true,
-      }),
-    });
-
-    await awaitRunCompletion(projectId, response.run.id, (event) => {
-      if (event.type === 'video-stages' && event.stages) {
-        const stages = (event.stages as VideoStage[]).map((stage) => ({
-          label: stage.label,
-          status: stage.status === 'idle' || stage.status === 'queued' ? 'running' : stage.status,
-          progress: stage.progress,
-        }));
-        onStageUpdate(stages);
-      }
-    });
-
-    const allVideos = await mockApi.listVideos(projectId);
-    const latest = allVideos.find((video) => video.runId === response.run.id) || allVideos[0];
-
-    if (!latest) {
-      throw new Error('Video generation did not return an output');
-    }
-
-    if (latest.status === 'failed') {
-      throw new Error('Video generation failed');
-    }
-
-    return latest;
+  async deleteVideo(projectId: string, videoId: string): Promise<void> {
+    return del(`/projects/${projectId}/videos/${videoId}`);
   },
 
   async listRuns(projectId: string): Promise<RunJob[]> {
@@ -394,16 +260,31 @@ export const mockApi = {
     return normalizeListResponse<RunJob>(response, `runs for project ${projectId}`);
   },
 
-  createRunJob(projectId: string, type: RunJob['type'], label: string, itemIds: string[]): RunJob {
-    return {
-      id: generateId('run'),
-      projectId,
-      type,
-      status: 'running',
-      startedAt: new Date().toISOString(),
-      completedAt: null,
-      itemIds,
-      label,
+  async getRun(projectId: string, runId: string): Promise<RunJob> {
+    return request<RunJob>(`/projects/${projectId}/runs/${runId}`);
+  },
+
+  subscribeToRun(projectId: string, runId: string, handlers: RunSubscriptionHandlers): () => void {
+    const eventSource = new EventSource(createSseUrl(`/projects/${projectId}/runs/${runId}/events`));
+
+    eventSource.onmessage = (message) => {
+      if (!message.data) {
+        return;
+      }
+
+      try {
+        handlers.onEvent(JSON.parse(message.data) as RunEvent);
+      } catch (error) {
+        handlers.onError?.(error instanceof Error ? error : new Error('Invalid run event payload'));
+      }
+    };
+
+    eventSource.onerror = () => {
+      handlers.onError?.(new Error('Run event stream disconnected'));
+    };
+
+    return () => {
+      eventSource.close();
     };
   },
 };

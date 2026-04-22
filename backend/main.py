@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from collections import defaultdict
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 import hashlib
 import json
@@ -17,20 +18,25 @@ import uuid
 import wave
 from typing import Any, Literal
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field, ValidationError
 
+from backend.utils.logger import configure_logging, get_logger
+from backend.utils.settings import (
+    AppSettingsResponse,
+    SettingsManager,
+    UpdateAppSettingsRequest,
+)
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-DATA_ROOT = REPO_ROOT / ".backend-data"
-PROJECTS_ROOT = DATA_ROOT / "projects"
-DB_PATH = DATA_ROOT / "metadata.db"
 SCRIPTS_DIR = REPO_ROOT / "scripts"
-OUTPUTS_ROOT = REPO_ROOT / "outputs"
-GLOBAL_DESIGNED_AUDIO_DIR = OUTPUTS_ROOT / "audios" / "designed"
-PROJECT_OUTPUTS_ROOT = OUTPUTS_ROOT / "projects"
+settings_manager = SettingsManager(REPO_ROOT)
+configure_logging(settings_manager.logs_dir)
+logger = get_logger(__name__)
+DB_PATH = settings_manager.state_db_path
 
 PROJECT_TABLE = "projects"
 ENTITY_TABLES = {"runs", "voice_designs", "audios", "images", "videos"}
@@ -71,6 +77,30 @@ def compute_script_fingerprint(content: str) -> str:
         digest ^= byte
         digest = (digest * 0x01000193) & 0xFFFFFFFF
     return f"{digest:08x}"
+
+
+def workspace_root() -> Path:
+    return settings_manager.workspace_root()
+
+
+def backend_data_root() -> Path:
+    return settings_manager.backend_data_root()
+
+
+def projects_root() -> Path:
+    return settings_manager.projects_root()
+
+
+def outputs_root() -> Path:
+    return settings_manager.outputs_root()
+
+
+def global_designed_audio_dir() -> Path:
+    return settings_manager.global_designed_audio_dir()
+
+
+def project_outputs_root() -> Path:
+    return settings_manager.project_outputs_root()
 
 
 class VideoSettings(BaseModel):
@@ -298,11 +328,16 @@ def default_video_settings(aspect_ratio: AspectRatio, project_name: str) -> Vide
 
 
 def log_validation_issue(scope: str, project_id: str | None, entity_id: str | None, exc: Exception) -> None:
-    print(
-        f"[backend] skipping invalid {scope}"
-        f"{f' for project {project_id}' if project_id else ''}"
-        f"{f' ({entity_id})' if entity_id else ''}: {exc}",
-        file=sys.stderr,
+    logger.warning(
+        "Skipping invalid persisted entity",
+        extra={
+            "context": {
+                "scope": scope,
+                "project_id": project_id,
+                "entity_id": entity_id,
+                "error": str(exc),
+            }
+        },
     )
 
 
@@ -629,12 +664,12 @@ def default_project_output_folder(project_id: str, project_name: str) -> str:
 
 
 def ensure_global_output_roots() -> None:
-    GLOBAL_DESIGNED_AUDIO_DIR.mkdir(parents=True, exist_ok=True)
-    PROJECT_OUTPUTS_ROOT.mkdir(parents=True, exist_ok=True)
+    global_designed_audio_dir().mkdir(parents=True, exist_ok=True)
+    project_outputs_root().mkdir(parents=True, exist_ok=True)
 
 
 def ensure_project_workspace(project_id: str) -> Path:
-    workspace = PROJECTS_ROOT / project_id
+    workspace = projects_root() / project_id
     workspace.mkdir(parents=True, exist_ok=True)
     script_path = workspace / "script.txt"
     if not script_path.exists():
@@ -643,7 +678,7 @@ def ensure_project_workspace(project_id: str) -> Path:
 
 
 def project_workspace(project_id: str) -> Path:
-    return PROJECTS_ROOT / project_id
+    return projects_root() / project_id
 
 
 def resolve_path_within(root: Path, relative_path: str | Path) -> Path:
@@ -662,7 +697,7 @@ def ensure_project_output_layout(project: Project) -> Project:
         project = project.model_copy(update={"outputFolder": folder, "updatedAt": now_iso()})
         store.upsert_project(project)
 
-    root = PROJECT_OUTPUTS_ROOT / folder
+    root = project_outputs_root() / folder
     (root / "audios" / "generated").mkdir(parents=True, exist_ok=True)
     (root / "images").mkdir(parents=True, exist_ok=True)
     (root / "videos").mkdir(parents=True, exist_ok=True)
@@ -671,7 +706,7 @@ def ensure_project_output_layout(project: Project) -> Project:
 
 def project_output_root(project: Project) -> Path:
     project = ensure_project_output_layout(project)
-    return PROJECT_OUTPUTS_ROOT / (project.outputFolder or "")
+    return project_outputs_root() / (project.outputFolder or "")
 
 
 def project_generated_audio_dir(project: Project) -> Path:
@@ -704,7 +739,7 @@ def project_asset_url(project: Project, absolute_path: Path) -> str:
 
 def global_asset_url(absolute_path: Path) -> str:
     ensure_global_output_roots()
-    rel_path = absolute_path.resolve().relative_to(OUTPUTS_ROOT.resolve())
+    rel_path = absolute_path.resolve().relative_to(outputs_root().resolve())
     return f"/api/global-assets/{rel_path.as_posix()}"
 
 
@@ -719,7 +754,7 @@ def resolve_asset_path(project_id: str, asset_path: str) -> Path:
 
 def resolve_global_asset_path(asset_path: str) -> Path:
     ensure_global_output_roots()
-    return resolve_path_within(OUTPUTS_ROOT, asset_path)
+    return resolve_path_within(outputs_root(), asset_path)
 
 
 def local_path_from_asset_url(project_id: str, url: str | None) -> Path | None:
@@ -747,7 +782,7 @@ def make_designed_voice_id(file_path: Path) -> str:
 def list_global_designed_voice_assets() -> list[DesignedVoiceAsset]:
     ensure_global_output_roots()
     candidates = sorted(
-        GLOBAL_DESIGNED_AUDIO_DIR.glob("designed_voice*_000.wav"),
+        global_designed_audio_dir().glob("designed_voice*_000.wav"),
         key=lambda path: path.stat().st_mtime,
         reverse=True,
     )
@@ -825,11 +860,11 @@ async def run_python_script(
     if not script_path.exists():
         raise RuntimeError(f"Script was not found: {script_path}")
 
-    workspace = ensure_project_workspace(project_id)
+    ensure_project_workspace(project_id)
 
     command = [sys.executable, str(script_path), *args]
     environment = os.environ.copy()
-    environment["SEALED_NECTOR_PROJECT_ROOT"] = str(workspace)
+    environment["SEALED_NECTOR_PROJECT_ROOT"] = str(workspace_root())
     if env_extra:
         for key, value in env_extra.items():
             environment[key] = value
@@ -913,10 +948,26 @@ def load_project_script(project_id: str) -> str:
     return get_script_path(project_id).read_text(encoding="utf-8")
 
 
+@asynccontextmanager
+async def lifespan(_: FastAPI) -> Any:
+    recovered_runs = recover_incomplete_runs()
+    logger.info(
+        "Backend startup completed",
+        extra={
+            "context": {
+                "projects_directory": str(workspace_root()),
+                "config_path": str(settings_manager.config_path),
+                "state_db_path": str(DB_PATH),
+                "recovered_runs": recovered_runs,
+            }
+        },
+    )
+    yield
+
+
 store = JsonStore(DB_PATH)
 broker = RunEventBroker()
-
-app = FastAPI(title="Sealed Nector Backend", version="0.1.0")
+app = FastAPI(title="Sealed Nector Backend", version="0.1.0", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -924,6 +975,71 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+def error_response(
+    status_code: int,
+    code: str,
+    message: str,
+    details: Any | None = None,
+) -> JSONResponse:
+    payload: dict[str, Any] = {
+        "message": message,
+        "error": {
+            "code": code,
+            "message": message,
+        },
+    }
+    if details is not None:
+        payload["error"]["details"] = details
+    return JSONResponse(status_code=status_code, content=payload)
+
+
+@app.exception_handler(HTTPException)
+async def http_exception_handler(_: Request, exc: HTTPException) -> JSONResponse:
+    detail = exc.detail
+    if isinstance(detail, dict):
+        message = str(detail.get("message") or detail.get("detail") or "Request failed")
+        details = detail
+    else:
+        message = str(detail)
+        details = None
+    return error_response(exc.status_code, "http_error", message, details)
+
+
+@app.exception_handler(RequestValidationError)
+async def request_validation_exception_handler(_: Request, exc: RequestValidationError) -> JSONResponse:
+    return error_response(
+        422,
+        "validation_error",
+        "Request validation failed",
+        exc.errors(),
+    )
+
+
+@app.exception_handler(ValidationError)
+async def validation_exception_handler(_: Request, exc: ValidationError) -> JSONResponse:
+    return error_response(
+        422,
+        "validation_error",
+        "Request validation failed",
+        exc.errors(),
+    )
+
+
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(request: Request, exc: Exception) -> JSONResponse:
+    logger.exception(
+        "Unhandled backend exception",
+        extra={
+            "context": {
+                "path": request.url.path,
+                "method": request.method,
+                "error": str(exc),
+            }
+        },
+    )
+    return error_response(500, "internal_error", "Unexpected server error")
 
 
 def require_project(project_id: str) -> Project:
@@ -943,6 +1059,97 @@ def get_run(project_id: str, run_id: str) -> RunJob:
         raise HTTPException(status_code=404, detail="Run not found")
     return RunJob.model_validate(payload)
 
+
+def recover_incomplete_runs() -> int:
+    recovered_runs = 0
+    for project in store.list_projects():
+        project_recovered = False
+        pending_runs = [
+            item
+            for item in load_valid_entities("runs", project.id, RunJob)
+            if isinstance(item, RunJob) and item.status in {"queued", "running"}
+        ]
+        if not pending_runs:
+            continue
+
+        for pending_run in pending_runs:
+            recovered_runs += 1
+            project_recovered = True
+            failed_run = pending_run.model_copy(
+                update={
+                    "status": "failed",
+                    "completedAt": now_iso(),
+                }
+            )
+            upsert_run(failed_run)
+
+            if pending_run.type == "voice-design":
+                for voice_design in list_voice_design_models(project.id):
+                    if voice_design.status not in {"queued", "running"}:
+                        continue
+                    store.upsert_entity(
+                        "voice_designs",
+                        project.id,
+                        voice_design.id,
+                        voice_design.model_copy(update={"status": "failed"}).model_dump(),
+                    )
+            elif pending_run.type == "generate-voice":
+                for audio in list_generated_audio_models(project.id):
+                    if audio.runId != pending_run.id or audio.status not in {"queued", "running"}:
+                        continue
+                    store.upsert_entity(
+                        "audios",
+                        project.id,
+                        audio.id,
+                        audio.model_copy(update={"status": "failed", "progress": 0}).model_dump(),
+                    )
+            elif pending_run.type == "generate-images":
+                for image in list_generated_image_models(project.id):
+                    if image.runId != pending_run.id or image.status not in {"queued", "running"}:
+                        continue
+                    store.upsert_entity(
+                        "images",
+                        project.id,
+                        image.id,
+                        image.model_copy(update={"status": "failed", "progress": 0}).model_dump(),
+                    )
+            elif pending_run.type == "generate-video":
+                for video in list_generated_video_models(project.id):
+                    if video.runId != pending_run.id or video.status not in {"queued", "running"}:
+                        continue
+                    failed_stages = [
+                        stage.model_copy(
+                            update={
+                                "status": "failed" if stage.status == "running" else stage.status,
+                                "progress": 0 if stage.status == "running" else stage.progress,
+                            }
+                        )
+                        for stage in video.stages
+                    ]
+                    store.upsert_entity(
+                        "videos",
+                        project.id,
+                        video.id,
+                        video.model_copy(update={"status": "failed", "progress": 0, "stages": failed_stages}).model_dump(),
+                    )
+
+            logger.warning(
+                "Recovered interrupted run",
+                extra={
+                    "context": {
+                        "project_id": project.id,
+                        "run_id": pending_run.id,
+                        "run_type": pending_run.type,
+                    }
+                },
+            )
+
+        if project_recovered:
+            store.upsert_project(
+                project.model_copy(update={"status": "failed", "updatedAt": now_iso()})
+            )
+
+    return recovered_runs
 
 def set_project_status(project_id: str, status: ProjectStatus) -> Project:
     project = require_project(project_id)
@@ -966,7 +1173,10 @@ def spawn_background_task(coroutine: Any) -> None:
         try:
             done_task.result()
         except Exception as exc:  # noqa: BLE001
-            print(f"[backend] background task failed: {exc}", file=sys.stderr)
+            logger.exception(
+                "Background task failed",
+                extra={"context": {"error": str(exc)}},
+            )
 
     task.add_done_callback(_log_background_failure)
 
@@ -980,6 +1190,19 @@ async def finalize_run(
     completed_run = run.model_copy(update={"status": status, "completedAt": now_iso()})
     upsert_run(completed_run)
     set_project_status(run.projectId, project_status)
+    logger.info(
+        "Run finalized",
+        extra={
+            "context": {
+                "project_id": run.projectId,
+                "run_id": run.id,
+                "run_type": run.type,
+                "status": status,
+                "project_status": project_status,
+                "error": error,
+            }
+        },
+    )
     await publish_run_event(completed_run.id, "run-update", {"run": completed_run.model_dump()})
     if error:
         await publish_run_event(completed_run.id, "run-error", {"message": error})
@@ -1083,7 +1306,6 @@ async def run_voice_design_pipeline(
             "VOICE_DESIGN_NAME": voice_slug,
             "VOICE_DESIGN_INSTRUCTION": voice_design.promptInstruction,
             "VOICE_DESIGN_SPEED": str(voice_design.speed),
-            "SEALED_NECTOR_PROJECT_ROOT": str(REPO_ROOT),
         }
         if voice_design.referenceText.strip():
             env_extra["VOICE_DESIGN_REFERENCE_TEXT"] = voice_design.referenceText
@@ -1103,7 +1325,7 @@ async def run_voice_design_pipeline(
         )
 
         ensure_global_output_roots()
-        designed_dir = GLOBAL_DESIGNED_AUDIO_DIR
+        designed_dir = global_designed_audio_dir()
         preferred_path = designed_dir / f"designed_voice_{voice_slug}_000.wav"
         if preferred_path.exists():
             audio_path = preferred_path
@@ -1585,6 +1807,7 @@ async def run_video_generation_pipeline(
             scriptFingerprint=script_fingerprint,
         )
         store.upsert_entity("videos", project_id, video_record.id, video_record.model_dump())
+        await publish_run_event(run.id, "video-update", {"video": video_record.model_dump()})
 
         segments = parse_script(project.scriptContent, project_id)
         if not segments:
@@ -1802,6 +2025,27 @@ def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
+@app.get("/api/settings", response_model=AppSettingsResponse)
+def get_settings() -> AppSettingsResponse:
+    return settings_manager.response_model()
+
+
+@app.put("/api/settings", response_model=AppSettingsResponse)
+def update_settings(request: UpdateAppSettingsRequest) -> AppSettingsResponse:
+    previous_directory = str(workspace_root())
+    settings = settings_manager.update(request)
+    logger.info(
+        "Updated application settings",
+        extra={
+            "context": {
+                "previous_projects_directory": previous_directory,
+                "projects_directory": settings.projectsDirectory,
+            }
+        },
+    )
+    return settings_manager.response_model()
+
+
 @app.get("/api/projects", response_model=list[Project])
 def list_projects() -> list[Project]:
     projects = [ensure_project_output_layout(project) for project in store.list_projects()]
@@ -1832,6 +2076,17 @@ def create_project(request: CreateProjectRequest) -> Project:
     ensure_project_output_layout(project)
     save_project_script(project.id, project.scriptContent)
     store.upsert_project(project)
+    logger.info(
+        "Created project",
+        extra={
+            "context": {
+                "project_id": project.id,
+                "project_name": project.name,
+                "language": project.language,
+                "aspect_ratio": project.aspectRatio,
+            }
+        },
+    )
     return project
 
 
@@ -1854,6 +2109,15 @@ def update_project(project_id: str, request: UpdateProjectRequest) -> Project:
 
     updated_project = project.model_copy(update={**update_payload, "updatedAt": now_iso()})
     store.upsert_project(updated_project)
+    logger.info(
+        "Updated project",
+        extra={
+            "context": {
+                "project_id": project_id,
+                "fields": sorted(update_payload.keys()),
+            }
+        },
+    )
     return updated_project
 
 
@@ -1867,6 +2131,10 @@ def delete_project(project_id: str) -> JSONResponse:
     output_root = project_output_root(project)
     if output_root.exists():
         shutil.rmtree(output_root)
+    logger.info(
+        "Deleted project",
+        extra={"context": {"project_id": project_id, "project_name": project.name}},
+    )
     return JSONResponse({"status": "deleted"})
 
 
@@ -1909,6 +2177,15 @@ def save_project_script_endpoint(project_id: str, request: ScriptUpdateRequest) 
     updated_project = project.model_copy(update={"scriptContent": request.content, "updatedAt": now_iso()})
     store.upsert_project(updated_project)
     segments = parse_script(request.content, project_id)
+    logger.info(
+        "Saved project script",
+        extra={
+            "context": {
+                "project_id": project_id,
+                "segment_count": len(segments),
+            }
+        },
+    )
     return {
         "content": request.content,
         "segments": [segment.model_dump() for segment in segments],
@@ -1959,6 +2236,16 @@ async def create_voice_design(project_id: str, request: VoiceDesignCreateRequest
         label=f"Design voice: {voice_design.name}",
     )
     upsert_run(run)
+    logger.info(
+        "Queued voice design run",
+        extra={
+            "context": {
+                "project_id": project_id,
+                "run_id": run.id,
+                "voice_design_id": voice_design.id,
+            }
+        },
+    )
 
     spawn_background_task(
         run_voice_design_pipeline(
@@ -2026,6 +2313,16 @@ async def generate_audios(project_id: str, request: GenerateAudiosRequest) -> di
         label="Generate voice segments",
     )
     upsert_run(run)
+    logger.info(
+        "Queued audio generation run",
+        extra={
+            "context": {
+                "project_id": project_id,
+                "run_id": run.id,
+                "segment_indices": request.segmentIndices,
+            }
+        },
+    )
     spawn_background_task(run_audio_generation_pipeline(project_id, run, request))
     return {"run": run.model_dump()}
 
@@ -2066,6 +2363,18 @@ async def generate_images(project_id: str, request: GenerateImagesRequest) -> di
         label="Generate scene images",
     )
     upsert_run(run)
+    logger.info(
+        "Queued image generation run",
+        extra={
+            "context": {
+                "project_id": project_id,
+                "run_id": run.id,
+                "segment_indices": request.segmentIndices,
+                "width": request.width,
+                "height": request.height,
+            }
+        },
+    )
     spawn_background_task(run_image_generation_pipeline(project_id, run, request))
     return {"run": run.model_dump()}
 
@@ -2107,6 +2416,16 @@ async def generate_video(project_id: str, request: GenerateVideoRequest) -> dict
         label="Generate final video",
     )
     upsert_run(run)
+    logger.info(
+        "Queued video generation run",
+        extra={
+            "context": {
+                "project_id": project_id,
+                "run_id": run.id,
+                "filename": settings.outputFilename,
+            }
+        },
+    )
     spawn_background_task(run_video_generation_pipeline(project_id, run, request, settings))
     return {"run": run.model_dump()}
 

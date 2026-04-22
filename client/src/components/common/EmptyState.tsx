@@ -29,15 +29,15 @@ export default function EmptyState({ icon: Icon, title, description, action }: P
         sx={{
           width: 72,
           height: 72,
-          borderRadius: '50%',
+          borderRadius: 3,
           display: 'flex',
           alignItems: 'center',
           justifyContent: 'center',
-          bgcolor: t => alpha(t.palette.primary.main, 0.1),
-          border: t => `1px solid ${alpha(t.palette.primary.main, 0.2)}`,
+          bgcolor: t => alpha(t.palette.primary.main, 0.14),
+          border: t => `1px solid ${alpha(t.palette.primary.main, 0.26)}`,
         }}
       >
-        <Icon sx={{ fontSize: 32, color: 'primary.main', opacity: 0.8 }} />
+        <Icon sx={{ fontSize: 32, color: 'primary.main', opacity: 1 }} />
       </Box>
       <Typography variant="h6" fontWeight={700} color="text.primary">{title}</Typography>
       {description && (

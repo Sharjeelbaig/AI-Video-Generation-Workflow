@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import Box from '@mui/material/Box';
 import Grid from '@mui/material/Grid';
 import Typography from '@mui/material/Typography';
@@ -28,20 +28,22 @@ import MovieOutlinedIcon from '@mui/icons-material/MovieOutlined';
 import CheckCircleOutlineIcon from '@mui/icons-material/CheckCircleOutline';
 import RadioButtonUncheckedIcon from '@mui/icons-material/RadioButtonUnchecked';
 import type {
-  Project,
   DesignedVoiceAsset,
   GeneratedAudio,
   GeneratedImage,
   GeneratedVideo,
+  Project,
   VideoSettings,
   VideoStage,
 } from '../../types';
 import StatusChip from '../common/StatusChip';
 import ConfirmDialog from '../common/ConfirmDialog';
 import MediaPreviewDialog, { type MediaPreviewTarget } from '../common/MediaPreviewDialog';
-import { mockApi, generateId } from '../../services/mockApi';
+import { mockApi } from '../../services/mockApi';
 import { useApp } from '../../store/AppContext';
 import { parseScript } from '../../services/scriptParser';
+import { exportAsset, filenameFromAssetUrl } from '../../services/fileExport';
+import { validateVideoSettings } from '../../services/validation';
 import {
   countStaleOutputs,
   formatOptionalRoundedSeconds,
@@ -57,7 +59,7 @@ interface Props {
   videos: GeneratedVideo[];
 }
 
-function ColorInput({ label, value, onChange }: { label: string; value: string; onChange: (v: string) => void }) {
+function ColorInput({ label, value, onChange }: { label: string; value: string; onChange: (value: string) => void }) {
   return (
     <Box>
       <Typography variant="caption" color="text.secondary" fontWeight={600} display="block" mb={0.75}>{label}</Typography>
@@ -66,7 +68,7 @@ function ColorInput({ label, value, onChange }: { label: string; value: string; 
           component="input"
           type="color"
           value={value}
-          onChange={e => onChange(e.target.value)}
+          onChange={(event) => onChange(event.target.value)}
           sx={{ width: 36, height: 28, border: 'none', borderRadius: 1, cursor: 'pointer', p: 0, bgcolor: 'transparent' }}
         />
         <Typography variant="caption" fontFamily="monospace">{value}</Typography>
@@ -87,8 +89,11 @@ function StageRow({ stage }: { stage: VideoStage }) {
       ) : (
         <RadioButtonUncheckedIcon sx={{ fontSize: 18, color: 'text.disabled', flexShrink: 0 }} />
       )}
-      <Typography variant="body2" fontWeight={stage.status === 'running' ? 600 : 400}
-        color={stage.status === 'success' ? 'success.main' : stage.status === 'running' ? 'text.primary' : 'text.secondary'}>
+      <Typography
+        variant="body2"
+        fontWeight={stage.status === 'running' ? 600 : 400}
+        color={stage.status === 'success' ? 'success.main' : stage.status === 'running' ? 'text.primary' : 'text.secondary'}
+      >
         {stage.label}
       </Typography>
       {stage.status === 'running' && (
@@ -105,16 +110,17 @@ export default function GenerateVideoTab({
   images = [],
   videos = [],
 }: Props) {
-  const { dispatch, toast } = useApp();
+  const { dispatch, toast, trackRun } = useApp();
   const [settings, setSettings] = useState<VideoSettings>(project.videoSettings);
   const [selectedVoiceId, setSelectedVoiceId] = useState('');
-  const [running, setRunning] = useState(false);
-  const [stages, setStages] = useState<VideoStage[]>([]);
   const [previewTarget, setPreviewTarget] = useState<MediaPreviewTarget | null>(null);
-  const safeDesignedVoices = Array.isArray(designedVoices) ? designedVoices : [];
-  const safeAudios = Array.isArray(audios) ? audios : [];
-  const safeImages = Array.isArray(images) ? images : [];
-  const safeVideos = Array.isArray(videos) ? videos : [];
+  const [deleteTarget, setDeleteTarget] = useState<GeneratedVideo | null>(null);
+  const [submitting, setSubmitting] = useState(false);
+
+  const safeDesignedVoices = useMemo(() => (Array.isArray(designedVoices) ? designedVoices : []), [designedVoices]);
+  const safeAudios = useMemo(() => (Array.isArray(audios) ? audios : []), [audios]);
+  const safeImages = useMemo(() => (Array.isArray(images) ? images : []), [images]);
+  const safeVideos = useMemo(() => (Array.isArray(videos) ? videos : []), [videos]);
 
   useEffect(() => {
     setSettings(project.videoSettings);
@@ -125,63 +131,64 @@ export default function GenerateVideoTab({
       setSelectedVoiceId('');
       return;
     }
-    if (!selectedVoiceId) {
-      return;
-    }
-    const hasSelection = safeDesignedVoices.some(voice => voice.id === selectedVoiceId);
-    if (!hasSelection) {
+    if (selectedVoiceId && !safeDesignedVoices.some((voice) => voice.id === selectedVoiceId)) {
       setSelectedVoiceId('');
     }
   }, [safeDesignedVoices, selectedVoiceId]);
-  const [deleteTarget, setDeleteTarget] = useState<GeneratedVideo | null>(null);
 
   const segments = parseScript(project.scriptContent, project.id);
   const { fresh: freshAudios } = partitionFreshOutputs(safeAudios, project.scriptContent);
   const { fresh: freshImages } = partitionFreshOutputs(safeImages, project.scriptContent);
-  const imageCount = freshImages.filter(image => image.status === 'success').length;
-  const matchedAudio = segments.filter(segment => freshAudios.some(audio => audio.segmentIndex === segment.index && audio.status === 'success'));
-  const scenesWithImages = segments.filter(segment => freshImages.some(image => image.segmentIndex === segment.index && image.status === 'success'));
-  const fallbackScenes = segments.filter(segment => !freshImages.some(image => image.segmentIndex === segment.index && image.status === 'success'));
+  const matchedAudio = segments.filter((segment) => freshAudios.some((audio) => audio.segmentIndex === segment.index && audio.status === 'success'));
+  const scenesWithImages = segments.filter((segment) => freshImages.some((image) => image.segmentIndex === segment.index && image.status === 'success'));
+  const fallbackScenes = segments.filter((segment) => !freshImages.some((image) => image.segmentIndex === segment.index && image.status === 'success'));
   const staleAudioCount = countStaleOutputs(safeAudios, project.scriptContent);
   const staleImageCount = countStaleOutputs(safeImages, project.scriptContent);
   const staleVideoCount = countStaleOutputs(safeVideos, project.scriptContent);
+  const runningVideo = safeVideos.find((video) => video.status === 'running');
+  const anyRunning = !!runningVideo;
 
-  const updateSetting = <K extends keyof VideoSettings>(key: K, val: VideoSettings[K]) => {
-    setSettings(prev => ({ ...prev, [key]: val }));
+  const updateSetting = <K extends keyof VideoSettings>(key: K, value: VideoSettings[K]) => {
+    setSettings((previous) => ({ ...previous, [key]: value }));
   };
 
   const handleGenerate = async () => {
-    setRunning(true);
-    const runId = generateId('run');
-    const run = mockApi.createRunJob(project.id, 'generate-video', 'Generate video', []);
-    dispatch({ type: 'ADD_RUN', projectId: project.id, payload: run });
-    dispatch({ type: 'UPDATE_PROJECT', payload: { ...project, status: 'running', videoSettings: settings, updatedAt: new Date().toISOString() } });
+    const validation = validateVideoSettings(settings);
+    if (!validation.success) {
+      toast(validation.message, 'warning');
+      return;
+    }
 
+    setSubmitting(true);
     try {
-      const video = await mockApi.generateVideo(
-        project.id, settings, selectedVoiceId || null, runId,
-        updatedStages => setStages(updatedStages.map(s => ({ ...s, status: s.status as VideoStage['status'] }))),
-      );
-      dispatch({ type: 'ADD_VIDEO', projectId: project.id, payload: video });
-      dispatch({ type: 'UPDATE_RUN', projectId: project.id, payload: { ...run, status: 'success', completedAt: new Date().toISOString() } });
-      try {
-        const refreshedProject = await mockApi.getProject(project.id);
-        dispatch({ type: 'UPDATE_PROJECT', payload: refreshedProject });
-      } catch {
-        dispatch({ type: 'UPDATE_PROJECT', payload: { ...project, status: 'success', videoSettings: settings, updatedAt: new Date().toISOString() } });
-      }
-      toast('Video generated successfully!', 'success');
-    } catch (e) {
-      dispatch({ type: 'UPDATE_RUN', projectId: project.id, payload: { ...run, status: 'failed', completedAt: new Date().toISOString() } });
-      dispatch({ type: 'UPDATE_PROJECT', payload: { ...project, status: 'failed', updatedAt: new Date().toISOString() } });
-      toast((e as Error).message, 'error');
+      const response = await mockApi.requestVideoGeneration(project.id, {
+        settings: validation.data,
+        designedVoiceId: selectedVoiceId || null,
+        autoGenerateAudios: true,
+        autoGenerateImages: true,
+      });
+      dispatch({
+        type: 'UPDATE_PROJECT',
+        payload: {
+          ...project,
+          videoSettings: validation.data,
+        },
+      });
+      trackRun(project.id, response.run, {
+        successMessage: 'Video generated successfully',
+        failureMessage: 'Video generation failed',
+      });
+    } catch (error) {
+      toast((error as Error).message, 'error');
     } finally {
-      setRunning(false);
+      setSubmitting(false);
     }
   };
 
   const handleDelete = async () => {
-    if (!deleteTarget) return;
+    if (!deleteTarget) {
+      return;
+    }
     try {
       await mockApi.deleteVideo(project.id, deleteTarget.id);
       dispatch({ type: 'DELETE_VIDEO', projectId: project.id, id: deleteTarget.id });
@@ -203,50 +210,89 @@ export default function GenerateVideoTab({
               <Typography variant="subtitle1" fontWeight={700} mb={2.5}>Video Settings</Typography>
               <Grid container spacing={2}>
                 <Grid size={{ xs: 4 }}>
-                  <TextField label="Width" type="number" size="small" fullWidth
-                    value={settings.width} onChange={e => updateSetting('width', parseInt(e.target.value))} />
+                  <TextField
+                    label="Width"
+                    type="number"
+                    size="small"
+                    fullWidth
+                    value={settings.width}
+                    onChange={(event) => updateSetting('width', Number(event.target.value))}
+                  />
                 </Grid>
                 <Grid size={{ xs: 4 }}>
-                  <TextField label="Height" type="number" size="small" fullWidth
-                    value={settings.height} onChange={e => updateSetting('height', parseInt(e.target.value))} />
+                  <TextField
+                    label="Height"
+                    type="number"
+                    size="small"
+                    fullWidth
+                    value={settings.height}
+                    onChange={(event) => updateSetting('height', Number(event.target.value))}
+                  />
                 </Grid>
                 <Grid size={{ xs: 4 }}>
-                  <TextField label="FPS" type="number" size="small" fullWidth
-                    value={settings.fps} onChange={e => updateSetting('fps', parseInt(e.target.value))} />
+                  <TextField
+                    label="FPS"
+                    type="number"
+                    size="small"
+                    fullWidth
+                    value={settings.fps}
+                    onChange={(event) => updateSetting('fps', Number(event.target.value))}
+                  />
                 </Grid>
                 <Grid size={{ xs: 6 }}>
-                  <TextField label="Font Family" size="small" fullWidth
-                    value={settings.fontFamily} onChange={e => updateSetting('fontFamily', e.target.value)} />
+                  <TextField
+                    label="Font Family"
+                    size="small"
+                    fullWidth
+                    value={settings.fontFamily}
+                    onChange={(event) => updateSetting('fontFamily', event.target.value)}
+                  />
                 </Grid>
                 <Grid size={{ xs: 6 }}>
-                  <TextField label="Arabic Font" size="small" fullWidth
-                    value={settings.arabicFontFamily} onChange={e => updateSetting('arabicFontFamily', e.target.value)} />
+                  <TextField
+                    label="Arabic Font"
+                    size="small"
+                    fullWidth
+                    value={settings.arabicFontFamily}
+                    onChange={(event) => updateSetting('arabicFontFamily', event.target.value)}
+                  />
                 </Grid>
                 <Grid size={{ xs: 12 }}>
                   <Divider sx={{ my: 0.5 }}><Typography variant="caption" color="text.secondary">Colors</Typography></Divider>
                 </Grid>
                 <Grid size={{ xs: 6, sm: 3 }}>
-                  <ColorInput label="Body" value={settings.bodyColor} onChange={v => updateSetting('bodyColor', v)} />
+                  <ColorInput label="Body" value={settings.bodyColor} onChange={(value) => updateSetting('bodyColor', value)} />
                 </Grid>
                 <Grid size={{ xs: 6, sm: 3 }}>
-                  <ColorInput label="Heading" value={settings.headingColor} onChange={v => updateSetting('headingColor', v)} />
+                  <ColorInput label="Heading" value={settings.headingColor} onChange={(value) => updateSetting('headingColor', value)} />
                 </Grid>
                 <Grid size={{ xs: 6, sm: 3 }}>
-                  <ColorInput label="SubHeading" value={settings.subHeadingColor} onChange={v => updateSetting('subHeadingColor', v)} />
+                  <ColorInput label="SubHeading" value={settings.subHeadingColor} onChange={(value) => updateSetting('subHeadingColor', value)} />
                 </Grid>
                 <Grid size={{ xs: 6, sm: 3 }}>
-                  <ColorInput label="Background" value={settings.backgroundColor} onChange={v => updateSetting('backgroundColor', v)} />
+                  <ColorInput label="Background" value={settings.backgroundColor} onChange={(value) => updateSetting('backgroundColor', value)} />
                 </Grid>
                 <Grid size={{ xs: 12 }}>
                   <Divider sx={{ my: 0.5 }}><Typography variant="caption" color="text.secondary">Options</Typography></Divider>
                 </Grid>
                 <Grid size={{ xs: 6, sm: 4 }}>
-                  <TextField label="Words/Scene" type="number" size="small" fullWidth
-                    value={settings.wordsPerScene} onChange={e => updateSetting('wordsPerScene', parseInt(e.target.value))} />
+                  <TextField
+                    label="Words/Scene"
+                    type="number"
+                    size="small"
+                    fullWidth
+                    value={settings.wordsPerScene}
+                    onChange={(event) => updateSetting('wordsPerScene', Number(event.target.value))}
+                  />
                 </Grid>
                 <Grid size={{ xs: 6, sm: 8 }}>
-                  <TextField label="Output Filename" size="small" fullWidth
-                    value={settings.outputFilename} onChange={e => updateSetting('outputFilename', e.target.value)} />
+                  <TextField
+                    label="Output Filename"
+                    size="small"
+                    fullWidth
+                    value={settings.outputFilename}
+                    onChange={(event) => updateSetting('outputFilename', event.target.value)}
+                  />
                 </Grid>
                 <Grid size={{ xs: 12 }}>
                   <FormControl size="small" fullWidth>
@@ -254,10 +300,10 @@ export default function GenerateVideoTab({
                     <Select
                       value={selectedVoiceId}
                       label="Designed Voice (optional)"
-                      onChange={e => setSelectedVoiceId(e.target.value)}
+                      onChange={(event) => setSelectedVoiceId(event.target.value)}
                     >
-                      <MenuItem value="">Auto (latest global voice)</MenuItem>
-                      {safeDesignedVoices.map(voice => (
+                      <MenuItem value="">Auto (latest shared voice)</MenuItem>
+                      {safeDesignedVoices.map((voice) => (
                         <MenuItem key={voice.id} value={voice.id}>{voice.name}</MenuItem>
                       ))}
                     </Select>
@@ -265,21 +311,24 @@ export default function GenerateVideoTab({
                 </Grid>
                 <Grid size={{ xs: 6 }}>
                   <FormControlLabel
-                    control={<Switch checked={settings.separatorLine} onChange={e => updateSetting('separatorLine', e.target.checked)} size="small" />}
+                    control={<Switch checked={settings.separatorLine} onChange={(event) => updateSetting('separatorLine', event.target.checked)} size="small" />}
                     label={<Typography variant="body2">Separator Line</Typography>}
                   />
                 </Grid>
                 <Grid size={{ xs: 6 }}>
                   <FormControlLabel
-                    control={<Switch checked={settings.fadeTransition} onChange={e => updateSetting('fadeTransition', e.target.checked)} size="small" />}
+                    control={<Switch checked={settings.fadeTransition} onChange={(event) => updateSetting('fadeTransition', event.target.checked)} size="small" />}
                     label={<Typography variant="body2">Fade Transition</Typography>}
                   />
                 </Grid>
                 {settings.fadeTransition && (
                   <Grid size={{ xs: 12 }}>
-                    <TextField label="Fade Duration (s)" type="number" size="small"
+                    <TextField
+                      label="Fade Duration (s)"
+                      type="number"
+                      size="small"
                       value={settings.fadeTransitionDuration}
-                      onChange={e => updateSetting('fadeTransitionDuration', parseFloat(e.target.value))}
+                      onChange={(event) => updateSetting('fadeTransitionDuration', Number(event.target.value))}
                       inputProps={{ step: 0.1, min: 0.1, max: 2 }}
                       sx={{ maxWidth: 180 }}
                     />
@@ -307,9 +356,9 @@ export default function GenerateVideoTab({
                 {[
                   { label: 'Total segments', value: segments.length, color: 'text.primary' },
                   { label: 'Matched audio', value: matchedAudio.length, color: matchedAudio.length > 0 ? 'success.main' : 'warning.main' },
-                  { label: 'Scenes with images', value: scenesWithImages.length, color: imageCount > 0 ? 'info.main' : 'text.secondary' },
+                  { label: 'Scenes with images', value: scenesWithImages.length, color: scenesWithImages.length > 0 ? 'info.main' : 'text.secondary' },
                   { label: 'Fallback scenes', value: fallbackScenes.length, color: fallbackScenes.length > 0 ? 'warning.main' : 'success.main' },
-                ].map(item => (
+                ].map((item) => (
                   <Stack key={item.label} direction="row" justifyContent="space-between" alignItems="center">
                     <Typography variant="body2" color="text.secondary">{item.label}</Typography>
                     <Chip label={item.value} size="small" sx={{ fontWeight: 700, color: item.color }} />
@@ -325,12 +374,12 @@ export default function GenerateVideoTab({
               <Button
                 variant="contained"
                 fullWidth
-                onClick={handleGenerate}
-                disabled={running}
+                onClick={() => void handleGenerate()}
+                disabled={submitting || anyRunning}
                 startIcon={<MovieOutlinedIcon />}
                 sx={{ mt: 3 }}
               >
-                {running ? 'Generating...' : 'Generate Video'}
+                {submitting || anyRunning ? 'Generating…' : 'Generate Video'}
               </Button>
               <Typography variant="caption" color="text.secondary" display="block" mt={1} textAlign="center">
                 Missing audio and image assets are generated automatically before rendering.
@@ -338,12 +387,12 @@ export default function GenerateVideoTab({
             </CardContent>
           </Card>
 
-          {running && stages.length > 0 && (
-            <Card sx={{ border: t => `1px solid ${alpha(t.palette.primary.main, 0.3)}` }}>
+          {runningVideo && runningVideo.stages.length > 0 && (
+            <Card sx={{ border: (theme) => `1px solid ${alpha(theme.palette.primary.main, 0.3)}` }}>
               <CardContent sx={{ p: 2.5 }}>
                 <Typography variant="subtitle2" fontWeight={700} mb={1.5}>Generation Progress</Typography>
                 <Stack divider={<Divider />}>
-                  {stages.map((stage, i) => <StageRow key={i} stage={stage} />)}
+                  {runningVideo.stages.map((stage, index) => <StageRow key={`${runningVideo.id}-${index}`} stage={stage} />)}
                 </Stack>
               </CardContent>
             </Card>
@@ -354,14 +403,14 @@ export default function GenerateVideoTab({
           <Grid size={12}>
             <Typography variant="subtitle1" fontWeight={700} mb={2}>Generated Videos</Typography>
             <Grid container spacing={2}>
-              {safeVideos.map(video => (
+              {safeVideos.map((video) => (
                 <Grid key={video.id} size={{ xs: 12, sm: 6, md: 4 }}>
                   <Card sx={{ borderRadius: 2, overflow: 'hidden' }}>
                     {video.thumbnailUrl ? (
                       <CardMedia component="img" image={video.thumbnailUrl} sx={{ height: 160, objectFit: 'cover' }} />
                     ) : (
-                      <Box sx={{ height: 160, display: 'flex', alignItems: 'center', justifyContent: 'center', bgcolor: t => alpha(t.palette.primary.main, 0.05) }}>
-                        <MovieOutlinedIcon sx={{ fontSize: 48, opacity: 0.3 }} />
+                      <Box sx={{ height: 160, display: 'flex', alignItems: 'center', justifyContent: 'center', bgcolor: (theme) => alpha(theme.palette.primary.main, 0.05) }}>
+                        <MovieOutlinedIcon sx={{ fontSize: 48, opacity: 0.65 }} />
                       </Box>
                     )}
                     <CardContent sx={{ p: 2, '&:last-child': { pb: 2 } }}>
@@ -396,8 +445,19 @@ export default function GenerateVideoTab({
                             </IconButton>
                           </span>
                         </Tooltip>
-                        <Tooltip title="Download">
-                          <IconButton size="small"><DownloadIcon sx={{ fontSize: 16 }} /></IconButton>
+                        <Tooltip title="Export">
+                          <span>
+                            <IconButton
+                              size="small"
+                              onClick={() => video.videoUrl && exportAsset(
+                                video.videoUrl,
+                                filenameFromAssetUrl(video.videoUrl, video.filename),
+                              ).catch((error: Error) => toast(error.message, 'error'))}
+                              disabled={!video.videoUrl}
+                            >
+                              <DownloadIcon sx={{ fontSize: 16 }} />
+                            </IconButton>
+                          </span>
                         </Tooltip>
                         <Tooltip title="Delete">
                           <IconButton size="small" onClick={() => setDeleteTarget(video)} sx={{ color: 'error.main' }}>

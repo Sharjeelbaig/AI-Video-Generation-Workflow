@@ -1,4 +1,5 @@
 <Heading>Location and Nature of Arab Tribes.</Heading>
+Location and Nature of Arab Tribes
 ---
 <image>
 Simple symbolic scene showing a bright sun breaking through a band of dark shadow over an empty desert horizon. Minimal composition with one or two symbolic elements, clean background. No text, no letters, no numbers, no logos. No people, no faces, no animals, no living beings. Avoid detailed maps and avoid complex geography.
@@ -14,3 +15,8 @@ the biography of Prophet مُحَمَّد Peace and blessings be upon him manife
 Simple symbolic scene showing a dark swamp in the foreground, a bright path crossing out of shadow, and a glowing horizon filled with light. Minimal composition with one or two symbolic elements, clean background. No text, no letters, no numbers, no logos. No people, no faces, no animals, no living beings. Avoid detailed maps and avoid complex geography.
 </image>
 that he communicated in order to deliver the human race from the swamp of darkness and polytheism
+---
+<image>
+Simple symbolic scene showing an open scroll, a closed manuscript, and a small compass arranged neatly on a plain surface. Minimal composition with one or two symbolic elements, clean background. No text, no letters, no numbers, no logos. No people, no faces, no animals, no living beings. Avoid detailed maps and avoid complex geography.
+</image>
+to the paradise of light and monotheism. An image, authentic as well as comprehensive, of this Message is therefore only attainable through careful study
